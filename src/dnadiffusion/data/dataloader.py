@@ -1,26 +1,34 @@
+import os
 import pickle
 from typing import Any
 
+import h5py
 import numpy as np
 import pandas as pd
 import torch
 import torchvision.transforms as T
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
-
-from dnadiffusion.utils.utils import one_hot_encode
+from tqdm import tqdm
 
 
 def get_dataset(
     data_path: str,
-    saved_data_path: str,
-    load_saved_data: bool,
+    saved_partition_path: str,
+    load_prepartitioning: bool,
     debug: bool,
-) -> tuple[Dataset, Dataset, list[int], dict[int, str]]:
+    load_embeddings: bool = True,
+    embedding_save_path: str | None = None,
+    foundation_model: str | None = None,
+
+) -> tuple[tuple[Dataset, Dataset, list[int], dict[int, str]], torch.Tensor, torch.Tensor]:
     encode_data = load_data(
         data_path,
-        saved_data_path,
-        load_saved_data,
+        saved_partition_path,
+        load_prepartitioning,
+        load_embeddings=load_embeddings,
+        embedding_save_path=embedding_save_path,
+        foundation_model=foundation_model,
     )
     if debug:
         x_data = encode_data["X_train"][:1]
@@ -40,7 +48,7 @@ def get_dataset(
     train_data = SequenceDataset(x_data, y_data)
     val_data = SequenceDataset(x_val_data, y_val_data)
 
-    return train_data, val_data, cell_num_list, numeric_to_tag_dict
+    return (train_data, val_data, cell_num_list, numeric_to_tag_dict), encode_data["train_mu"], encode_data["train_sd"]
 
 
 def get_dataset_for_sampling(
@@ -114,35 +122,87 @@ def get_dataloader(
     return dataloader, sampler
 
 
+def _compute_mean_std(X_train_embed, output_dir):
+    # X_train_embed: numpy array (N,D, L), float32
+    embedd_dim = X_train_embed.shape[1]
+    X = torch.from_numpy(X_train_embed)  # (N, 48, 200)
+    mu = X.mean(dim=(0, 2))
+    sd = X.std(dim=(0, 2), unbiased=False)
+    sd = sd.clamp_min(1e-6)
+
+    # reshape to broadcast with (B, 1, D, L)
+    mu = mu.view(1, 1, embedd_dim, 1)
+    sd = sd.view(1, 1, embedd_dim, 1)
+
+    torch.save({"mu": mu, "sd": sd}, os.path.join(output_dir, "embed_whiten_stats.pt"))
+    return mu, sd
+
+
 def load_data(
     data_path: str,
-    saved_data_path: str,
-    load_saved_data: bool,
-    sequence_length: int = 200,
+    saved_partition_path: str,
+    load_prepartitioning: bool,
+    load_embeddings: bool,
+    embedding_save_path: str,
+    foundation_model: str,
 ):
     # Preprocessing data
-    if load_saved_data:
-        with open(saved_data_path, "rb") as f:
+    if load_prepartitioning:
+        with open(saved_partition_path, "rb") as f:
             encode_data = pickle.load(f)
-
     else:
-        output_path = saved_data_path
-        encode_data = preprocess_data(data_path, output_path)
+        encode_data = preprocess_data(data_path, saved_partition_path)
 
     # Creating sequence dataset
     df = encode_data["train_df"]
-    nucleotides = ["A", "C", "G", "T"]
-    x_train_seq = np.array([one_hot_encode(x, nucleotides, sequence_length) for x in df["sequence"] if "N" not in x])
-    X_train = np.array([x.T.tolist() for x in x_train_seq])
-    X_train[X_train == 0] = -1
-
-    # Create test dataset using chr1
     val_df = encode_data["validation_df"]
-    val_test_seq = np.array(
-        [one_hot_encode(x, nucleotides, sequence_length) for x in val_df["sequence"] if "N" not in x]
-    )
-    X_val = np.array([x.T.tolist() for x in val_test_seq])
-    X_val[X_val == 0] = -1
+
+    req_embedding_save_path = os.path.join(embedding_save_path, foundation_model)
+    train_embed_file = os.path.join(req_embedding_save_path, "train_embeddings.h5")
+    val_embed_file = os.path.join(req_embedding_save_path, "val_embeddings.h5")
+    if not load_embeddings:
+        from dnadiffusion.utils.caduceus_tokenization import embedd_dna_sequence
+        chunk_size = 200
+        with h5py.File(train_embed_file, "w") as h5f:
+            dset = h5f.create_dataset(
+                "train_embeddings",
+                shape=(len(df), 200, 512),
+                dtype="float32"
+            )
+            # embedd train data
+            for start in tqdm(range(0, len(df), chunk_size), desc="Embedding train data"):
+                X_train_chunk = embedd_dna_sequence(
+                    seqs=df["sequence"].iloc[start: start + chunk_size].to_list(),
+                ).cpu().numpy()
+                dset[start: start + chunk_size] = X_train_chunk
+
+        with h5py.File(val_embed_file, "w") as h5f:
+            dset = h5f.create_dataset(
+                "val_embeddings",
+                shape=(len(val_df), 200, 512),
+                dtype="float32"
+            )
+            # embedd val data
+            for start in tqdm(range(0, len(val_df), chunk_size), desc="Embedding train data"):
+                X_val_chunk = embedd_dna_sequence(
+                    seqs=val_df["sequence"].iloc[start: start + chunk_size].to_list(),
+                ).cpu().numpy()
+                dset[start: start + chunk_size] = X_val_chunk
+
+    with h5py.File(train_embed_file, "r") as h5f:
+        X_train = h5f["train_embeddings"][:]
+        X_train = X_train.transpose(0, 2, 1)
+    with h5py.File(val_embed_file, "r") as h5f:
+        X_val = h5f["val_embeddings"][:]
+        X_val = X_val.transpose(0, 2, 1)
+
+    if not load_embeddings:
+        # compute and store std and mean
+        train_mu, train_sd = _compute_mean_std(X_train, req_embedding_save_path)
+    else:
+        mu_sd_dict = torch.load(os.path.join(req_embedding_save_path, "embed_whiten_stats.pt"))
+        train_mu = mu_sd_dict["mu"]
+        train_sd = mu_sd_dict["sd"]
 
     # Creating labels
     tag_to_numeric = {x: n for n, x in enumerate(df["TAG"].unique(), 1)}
@@ -162,6 +222,8 @@ def load_data(
         "X_val": X_val,
         "x_train_cell_type": x_train_cell_type,
         "x_val_cell_type": x_val_cell_type,
+        "train_mu": train_mu,
+        "train_sd": train_sd
     }
 
     return encode_data_dict

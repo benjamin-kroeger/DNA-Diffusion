@@ -1,6 +1,7 @@
 import os
 
 import hydra
+import numpy as np
 import torch
 import wandb
 from omegaconf import DictConfig, OmegaConf
@@ -31,6 +32,7 @@ def train(
     sample_epoch: int,
     number_of_samples: int,
     use_wandb: bool,
+    grad_acc_steps: int,
 ) -> None:
     if distributed:
         local_rank = int(os.environ["LOCAL_RANK"])
@@ -68,12 +70,21 @@ def train(
     for epoch in tqdm(range(num_epochs), disable=not rank_0):
         if distributed:
             train_sampler.set_epoch(epoch)
-
-        for x, y in train_dl:
-            loss = train_step(x, y, model, optimizer, device, precision)
+        recent_losses = []
+        for x, y in tqdm(train_dl,desc=f"Training epoch {epoch}"):
+            loss = train_step(x, y, model, optimizer, device, precision,grad_acc_steps=grad_acc_steps)
             global_step += 1
-            if rank_0 == 0 and global_step % log_step == 0 and use_wandb:
-                wandb.log({"loss": loss, "epoch": epoch}, step=global_step)
+            recent_losses.append(loss)
+
+            if global_step % grad_acc_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+
+            #if rank_0 == 0 and global_step % log_step == 0 and use_wandb:
+            if rank_0 and global_step % log_step == 0 and use_wandb:
+                wandb.log({"loss": np.average(recent_losses), "epoch": epoch}, step=global_step)
+                recent_losses.clear()
+
 
         val_losses = []
         for x, y in val_dl:
@@ -140,10 +151,11 @@ def train(
 def main(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
     train_setup = {**cfg.training}
+
+    data, train_mu,train_sd = hydra.utils.instantiate(cfg.data)
     model = hydra.utils.instantiate(cfg.model)
-    data = hydra.utils.instantiate(cfg.data)
     optimizer = hydra.utils.instantiate(cfg.optimizer, model.parameters())
-    diffusion = hydra.utils.instantiate(cfg.diffusion, model=model)
+    diffusion = hydra.utils.instantiate(cfg.diffusion, model=model, mu=train_mu, sd=train_sd)
 
     train(
         **train_setup,

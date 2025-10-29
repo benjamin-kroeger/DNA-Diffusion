@@ -14,10 +14,15 @@ class Diffusion(nn.Module):
         timesteps: int,
         beta_start: float,
         beta_end: float,
+        mu: torch.Tensor,
+        sd: torch.Tensor,
     ):
         super().__init__()
         self.model = model
         self.timesteps = timesteps
+
+        self.register_buffer("mu", mu.float())
+        self.register_buffer("sd", sd.float())
 
         # Diffusion params
         betas = linear_beta_schedule(timesteps, beta_start, beta_end)
@@ -42,21 +47,31 @@ class Diffusion(nn.Module):
         return self.betas.device
 
     @torch.no_grad()
-    def sample(self, classes, shape, cond_weight):
-        return self.p_sample_loop(
+    def sample(self, classes, shape, cond_weight, dewhiten: bool = False):
+        imgs = self.p_sample_loop(
             classes=classes,
             image_size=shape,
             cond_weight=cond_weight,
         )
+        if dewhiten:
+            x0 = torch.as_tensor(imgs[-1], device=self.device)  # (B,1,D,L)
+            x0 = x0 * (self.sd + 1e-6) + self.mu  # back to raw scale
+            imgs[-1] = x0.float().cpu().numpy()
+        return imgs
 
     @torch.no_grad()
-    def sample_cross(self, classes, shape, cond_weight):
-        return self.p_sample_loop(
+    def sample_cross(self, classes, shape, cond_weight, dewhiten: bool = False):
+        imgs, cross = self.p_sample_loop(
             classes=classes,
             image_size=shape,
             cond_weight=cond_weight,
             get_cross_map=True,
         )
+        if dewhiten:
+            x0 = torch.as_tensor(imgs[-1], device=self.device)
+            x0 = x0 * (self.sd + 1e-6) + self.mu
+            imgs[-1] = x0.float().cpu().numpy()
+        return imgs, cross
 
     @torch.no_grad()
     def p_sample_loop(self, classes, image_size, cond_weight, get_cross_map=False):
@@ -162,6 +177,14 @@ class Diffusion(nn.Module):
 
     def p_losses(self, x_start, t, classes, noise=None, loss_type="huber", p_uncond=0.1):
         device = self.device
+
+        # TODO
+        x_start = x_start[:,:,:100,:]
+        self.mu = self.mu[:,:,:100,:]
+        self.sd = self.sd[:,:,:100,:]
+        # norm
+        x_start = (x_start - self.mu) / (self.sd + 1e-6)
+
         noise = default(noise, torch.randn_like(x_start, device=device))
 
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)

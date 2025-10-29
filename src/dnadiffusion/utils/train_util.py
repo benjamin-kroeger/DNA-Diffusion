@@ -31,6 +31,8 @@ def train_step(
     optimizer: torch.optim.Optimizer,
     device: Any,
     precision: str | None = None,
+    grad_acc_steps: int = 1,
+
 ):
     if precision == "bf16":
         dtype = torch.bfloat16
@@ -41,10 +43,10 @@ def train_step(
     y = y.to(device)
     with torch.autocast(device_type=device, dtype=dtype):
         loss = model(x, y)
+        scaled_loss = loss / grad_acc_steps
 
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+    scaled_loss.backward()
+
     return loss.mean().item()
 
 

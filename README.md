@@ -184,13 +184,13 @@ additional metadata columns like start, end, continuous accessibility are allowe
 The data loading config can be found at `configs/data/default.yaml`, and you can override the default data loading config by passing the `data` parameter to the command line. For example, to use a custom data file, you can run:
 
 ```bash
-uv run train.py data.data_path=path/to/your/data.txt data.load_saved_data=False
+uv run train.py data.data_path=path/to/your/data.txt data.load_prepartitioning=False
 ```
 
 It is important to set `data.load_saved_data=False` to ensure that cached data is not used, and instead is regenerated from the provided data file. This will ensure that the model is trained on your own data. This will overwrite the default pkl file, so if you would like to keep the original data, you can set `data.saved_data_path` to a different path. For example:
 
 ```bash
-uv run train.py data.data_path=path/to/your/data.txt data.load_saved_data=False data.saved_data_path=path/to/your/saved_data.pkl
+uv run train.py data.data_path=path/to/your/data.txt data.load_prepartitioning=False data.saved_partition_path=path/to/your/saved_data.pkl
 ```
 
 A colab notebook demonstrating an example of training using your own data is provided. This example uses a dummy dataset of three 200bp sequences with a single cell type "CELL_A".
