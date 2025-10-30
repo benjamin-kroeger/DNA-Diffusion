@@ -11,6 +11,8 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
+from dnadiffusion.utils.caduceus_tokenization import embed_and_save_sequences, load_embeddings_from_h5
+
 
 def get_dataset(
     data_path: str,
@@ -161,40 +163,22 @@ def load_data(
     train_embed_file = os.path.join(req_embedding_save_path, "train_embeddings.h5")
     val_embed_file = os.path.join(req_embedding_save_path, "val_embeddings.h5")
     if not load_embeddings:
-        from dnadiffusion.utils.caduceus_tokenization import embedd_dna_sequence
-        chunk_size = 200
-        with h5py.File(train_embed_file, "w") as h5f:
-            dset = h5f.create_dataset(
-                "train_embeddings",
-                shape=(len(df), 200, 512),
-                dtype="float32"
-            )
-            # embedd train data
-            for start in tqdm(range(0, len(df), chunk_size), desc="Embedding train data"):
-                X_train_chunk = embedd_dna_sequence(
-                    seqs=df["sequence"].iloc[start: start + chunk_size].to_list(),
-                ).cpu().numpy()
-                dset[start: start + chunk_size] = X_train_chunk
+        embed_and_save_sequences(
+            df=df,
+            chunk_size=200,
+            output_file=train_embed_file,
+        )
+        embed_and_save_sequences(
+            df=val_df,
+            chunk_size=200,
+            output_file=val_embed_file
+        )
 
-        with h5py.File(val_embed_file, "w") as h5f:
-            dset = h5f.create_dataset(
-                "val_embeddings",
-                shape=(len(val_df), 200, 512),
-                dtype="float32"
-            )
-            # embedd val data
-            for start in tqdm(range(0, len(val_df), chunk_size), desc="Embedding train data"):
-                X_val_chunk = embedd_dna_sequence(
-                    seqs=val_df["sequence"].iloc[start: start + chunk_size].to_list(),
-                ).cpu().numpy()
-                dset[start: start + chunk_size] = X_val_chunk
+    X_train,_,_ = load_embeddings_from_h5(train_embed_file)
+    X_train = X_train.transpose(0, 2, 1)
 
-    with h5py.File(train_embed_file, "r") as h5f:
-        X_train = h5f["train_embeddings"][:]
-        X_train = X_train.transpose(0, 2, 1)
-    with h5py.File(val_embed_file, "r") as h5f:
-        X_val = h5f["val_embeddings"][:]
-        X_val = X_val.transpose(0, 2, 1)
+    X_val,_,_ = load_embeddings_from_h5(val_embed_file)
+    X_val = X_val.transpose(0, 2, 1)
 
     if not load_embeddings:
         # compute and store std and mean
