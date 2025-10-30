@@ -154,9 +154,12 @@ def main(cfg: DictConfig) -> None:
     train_setup = {**cfg.training}
 
     data, train_mu,train_sd = hydra.utils.instantiate(cfg.data)
+    print("Data loaded")
     model = hydra.utils.instantiate(cfg.model)
+    print("unet instantiated")
     optimizer = hydra.utils.instantiate(cfg.optimizer, model.parameters())
     diffusion = hydra.utils.instantiate(cfg.diffusion, model=model, mu=train_mu, sd=train_sd)
+    print("diffusion instantiated")
 
     train(
         **train_setup,
