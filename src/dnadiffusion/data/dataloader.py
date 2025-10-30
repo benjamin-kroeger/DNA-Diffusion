@@ -174,10 +174,10 @@ def load_data(
             output_file=val_embed_file
         )
 
-    X_train,_,_ = load_embeddings_from_h5(train_embed_file)
+    X_train = load_embeddings_from_h5(train_embed_file)[0]
     X_train = X_train.transpose(0, 2, 1)
 
-    X_val,_,_ = load_embeddings_from_h5(val_embed_file)
+    X_val = load_embeddings_from_h5(val_embed_file)[0]
     X_val = X_val.transpose(0, 2, 1)
 
     if not load_embeddings:

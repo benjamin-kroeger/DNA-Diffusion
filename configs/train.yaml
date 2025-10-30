@@ -1,6 +1,6 @@
 defaults:
     - model: unet
     - data: default
-    - optimizer: adam
+    - optimizer: adamWbitbyte
     - diffusion: default
     - training: default

@@ -1,6 +1,6 @@
 _target_: src.dnadiffusion.models.unet.UNet
-hidden_dim: 200
+dim: 200
 channels: 1
 dim_mults: [1,2,4]
 resnet_block_groups: 4
-embed_dim: 100
+embedding_dim: 100

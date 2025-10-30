@@ -1,15 +1,16 @@
 import os
 
+import bitsandbytes as bnb
 import hydra
 import numpy as np
 import torch
-import wandb
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
 from torch.distributed.checkpoint.state_dict import get_state_dict
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
+import wandb
 from dnadiffusion.data.dataloader import get_dataloader
 from dnadiffusion.utils.sample_util import create_sample
 from dnadiffusion.utils.train_util import distributed_setup, init_wandb, train_step, val_step

@@ -179,9 +179,9 @@ class Diffusion(nn.Module):
         device = self.device
 
         # TODO
-        x_start = x_start[:,:,:100,:]
-        self.mu = self.mu[:,:,:100,:]
-        self.sd = self.sd[:,:,:100,:]
+        #x_start = x_start[:,:,:100,:]
+        # self.mu = self.mu[:,:,:100,:]
+        # self.sd = self.sd[:,:,:100,:]
         # norm
         x_start = (x_start - self.mu) / (self.sd + 1e-6)
 
