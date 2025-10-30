@@ -1,0 +1,7 @@
+_target_: src.dnadiffusion.models.unet.load_from_checkpoint
+dim: 200
+channels: 1
+dim_mults: [1,2,4]
+resnet_block_groups: 4
+embedding_dim: 512
+checkpoint_path: /home/benjaminkroeger/Documents/Master/UBC/Synthetic_data/DNA-Diffusion/checkpoints/model_epoch1_step78508_valloss_0.125004.pt

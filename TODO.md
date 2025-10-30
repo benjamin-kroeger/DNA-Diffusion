@@ -11,3 +11,6 @@ questions:
 - test if embedding generated with more context lead to better results
 - test different foundation models
 - tsne / umap gt_embedds vs pred embedds
+
+
+

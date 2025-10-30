@@ -1,6 +1,6 @@
 defaults:
-    - model: unet
+    - model: unet_from_checkpoint
     - data: debug
-    - optimizer: adam
+    - optimizer: adamWbitbyte
     - diffusion: default
-    - training: debug
+    - training: default

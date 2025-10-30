@@ -56,8 +56,8 @@ def sample(
 def main(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
     model = hydra.utils.instantiate(cfg.model)
-    data = hydra.utils.instantiate(cfg.data)
-    diffusion = hydra.utils.instantiate(cfg.diffusion, model=model)
+    data, train_mu,train_sd = hydra.utils.instantiate(cfg.data)
+    diffusion = hydra.utils.instantiate(cfg.diffusion, model=model, mu=train_mu, sd=train_sd)
 
     sample(
         data=data,

@@ -219,3 +219,16 @@ class UNet(nn.Module):
         if self.output_attention:
             return x, cross_attn_out
         return x
+
+
+def load_from_checkpoint(checkpoint_path,**kwargs):
+    # Load checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+
+    # Instantiate the UNet model
+    model = UNet(**kwargs)
+
+    # Load the saved weights
+    model.load_state_dict(checkpoint['model'])
+
+    return model

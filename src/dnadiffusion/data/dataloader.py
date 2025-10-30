@@ -31,6 +31,7 @@ def get_dataset(
         load_embeddings=load_embeddings,
         embedding_save_path=embedding_save_path,
         foundation_model=foundation_model,
+        debug=debug
     )
     if debug:
         x_data = encode_data["X_train"][:1]
@@ -55,20 +56,26 @@ def get_dataset(
 
 def get_dataset_for_sampling(
     data_path: str,
-    saved_data_path: str,
-    load_saved_data: bool,
+    saved_partition_path: str,
+    load_prepartitioning: bool,
+    load_embeddings: bool,
+    embedding_save_path: str,
+    foundation_model: str,
     debug: bool,
     cell_types: str | list[str] | None = None,
-) -> tuple[Dataset, Dataset, list[int], dict[int, str]]:
-    train_data, val_data, cell_num_list, numeric_to_tag_dict = get_dataset(
-        data_path,
-        saved_data_path,
-        load_saved_data,
-        debug,
+) -> tuple[tuple[Dataset, Dataset, list[int], dict[int, str]], torch.Tensor, torch.Tensor]:
+    (train_data, val_data, cell_num_list, numeric_to_tag_dict), train_mu, train_sd = get_dataset(
+        data_path=data_path,
+        saved_partition_path=saved_partition_path,
+        load_prepartitioning=load_prepartitioning,
+        debug=debug,
+        load_embeddings=load_embeddings,
+        embedding_save_path=embedding_save_path,
+        foundation_model=foundation_model,
     )
 
     if cell_types is None:
-        return train_data, val_data, cell_num_list, numeric_to_tag_dict
+        return (train_data, val_data, cell_num_list, numeric_to_tag_dict), train_mu, train_sd
 
     if isinstance(cell_types, str):
         if "," in cell_types:
@@ -97,7 +104,7 @@ def get_dataset_for_sampling(
     if not filtered_cell_nums:
         raise ValueError(f"No valid cell types found. Available types: {list(tag_to_numeric.keys())}")
 
-    return train_data, val_data, filtered_cell_nums, numeric_to_tag_dict
+    return (train_data, val_data, cell_num_list, numeric_to_tag_dict), train_mu, train_sd
 
 
 def get_dataloader(
@@ -124,7 +131,7 @@ def get_dataloader(
     return dataloader, sampler
 
 
-def _compute_mean_std(X_train_embed, output_dir):
+def _compute_mean_std(X_train_embed, output_dir, debug=False):
     # X_train_embed: numpy array (N,D, L), float32
     embedd_dim = X_train_embed.shape[1]
     X = torch.from_numpy(X_train_embed)  # (N, 48, 200)
@@ -136,7 +143,7 @@ def _compute_mean_std(X_train_embed, output_dir):
     mu = mu.view(1, 1, embedd_dim, 1)
     sd = sd.view(1, 1, embedd_dim, 1)
 
-    torch.save({"mu": mu, "sd": sd}, os.path.join(output_dir, "embed_whiten_stats.pt"))
+    torch.save({"mu": mu, "sd": sd}, os.path.join(output_dir, f"embed_whiten_stats{'_debug' if debug else ""}.pt"))
     return mu, sd
 
 
@@ -147,6 +154,7 @@ def load_data(
     load_embeddings: bool,
     embedding_save_path: str,
     foundation_model: str,
+    debug: bool = False
 ):
     # Preprocessing data
     if load_prepartitioning:
@@ -160,18 +168,20 @@ def load_data(
     val_df = encode_data["validation_df"]
 
     req_embedding_save_path = os.path.join(embedding_save_path, foundation_model)
-    train_embed_file = os.path.join(req_embedding_save_path, "train_embeddings.h5")
-    val_embed_file = os.path.join(req_embedding_save_path, "val_embeddings.h5")
+    train_embed_file = os.path.join(req_embedding_save_path, f"train_embeddings{'_debug' if debug else ""}.h5")
+    val_embed_file = os.path.join(req_embedding_save_path, f"val_embeddings{'_debug' if debug else ""}.h5")
     if not load_embeddings:
         embed_and_save_sequences(
             df=df,
             chunk_size=200,
             output_file=train_embed_file,
+            debug=debug
         )
         embed_and_save_sequences(
             df=val_df,
             chunk_size=200,
-            output_file=val_embed_file
+            output_file=val_embed_file,
+            debug=debug
         )
 
     X_train = load_embeddings_from_h5(train_embed_file)[0]
@@ -182,9 +192,9 @@ def load_data(
 
     if not load_embeddings:
         # compute and store std and mean
-        train_mu, train_sd = _compute_mean_std(X_train, req_embedding_save_path)
+        train_mu, train_sd = _compute_mean_std(X_train, req_embedding_save_path, debug=debug)
     else:
-        mu_sd_dict = torch.load(os.path.join(req_embedding_save_path, "embed_whiten_stats.pt"))
+        mu_sd_dict = torch.load(os.path.join(req_embedding_save_path, f"embed_whiten_stats{'_debug' if debug else ""}.pt"))
         train_mu = mu_sd_dict["mu"]
         train_sd = mu_sd_dict["sd"]
 

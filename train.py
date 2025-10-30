@@ -1,9 +1,11 @@
 import os
 
-import bitsandbytes as bnb
 import hydra
 import numpy as np
 import torch
+from dnadiffusion.data.dataloader import get_dataloader
+from dnadiffusion.utils.sample_util import create_sample
+from dnadiffusion.utils.train_util import distributed_setup, init_wandb, train_step, val_step
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
 from torch.distributed.checkpoint.state_dict import get_state_dict
@@ -11,9 +13,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
 import wandb
-from dnadiffusion.data.dataloader import get_dataloader
-from dnadiffusion.utils.sample_util import create_sample
-from dnadiffusion.utils.train_util import distributed_setup, init_wandb, train_step, val_step
 
 
 def train(
@@ -148,7 +147,7 @@ def train(
                 )
 
 
-@hydra.main(config_path="configs", config_name="train", version_base="1.3")
+@hydra.main(config_path="configs", config_name="train_debug", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
     train_setup = {**cfg.training}

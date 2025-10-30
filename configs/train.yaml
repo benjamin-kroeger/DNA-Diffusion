@@ -1,5 +1,5 @@
 defaults:
-    - model: unet
+    - model: unet_from_checkpoint
     - data: default
     - optimizer: adamWbitbyte
     - diffusion: default
