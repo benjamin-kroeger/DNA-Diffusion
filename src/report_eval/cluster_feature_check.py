@@ -317,6 +317,201 @@ class STREMERunner:
         return results
 
 
+class MEMESuiteRunner:
+    """
+    Run MEME suite tools for motif analysis.
+
+    Tools included:
+    - STREME: Fast discriminative motif discovery (short motifs, 6-15bp)
+    - MEME: Classic motif discovery (longer, more complex motifs)
+
+    These are the most useful for understanding cluster differences in
+    generative DNA models.
+    """
+
+    def __init__(self,
+                 streme_path: str = 'streme',
+                 meme_path: str = 'meme'):
+        self.streme_path = streme_path
+        self.meme_path = meme_path
+
+    def check_tool_available(self, tool_path: str) -> bool:
+        """Check if a MEME suite tool is available."""
+        try:
+            result = subprocess.run([tool_path, '--version'],
+                                    capture_output=True, text=True, timeout=10)
+            return True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
+    def get_available_tools(self) -> Dict[str, bool]:
+        """Check which MEME suite tools are available."""
+        return {
+            'streme': self.check_tool_available(self.streme_path),
+            'meme': self.check_tool_available(self.meme_path),
+        }
+
+    @staticmethod
+    def write_fasta(sequences: List[str], filepath: str, prefix: str = 'seq'):
+        """Write sequences to FASTA file."""
+        with open(filepath, 'w') as f:
+            for i, seq in enumerate(sequences):
+                f.write(f'>{prefix}_{i}\n{seq}\n')
+
+    def run_streme(self,
+                   positive_seqs: List[str],
+                   negative_seqs: Optional[List[str]],
+                   output_dir: str,
+                   minw: int = 6,
+                   maxw: int = 15,
+                   nmotifs: int = 10) -> Dict:
+        """
+        Run STREME for discriminative motif discovery.
+
+        Finds short motifs (6-15bp) enriched in positive vs negative sequences.
+        Fast and good for finding simple distinguishing patterns.
+        """
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pos_fasta = os.path.join(tmpdir, 'positive.fa')
+            self.write_fasta(positive_seqs, pos_fasta, 'pos')
+
+            cmd = [self.streme_path, '--p', pos_fasta, '--oc', str(output_path),
+                   '--minw', str(minw), '--maxw', str(maxw),
+                   '--nmotifs', str(nmotifs), '--thresh', '0.05', '--dna']
+
+            if negative_seqs:
+                neg_fasta = os.path.join(tmpdir, 'negative.fa')
+                self.write_fasta(negative_seqs, neg_fasta, 'neg')
+                cmd.extend(['--n', neg_fasta])
+
+            print(f"    Running STREME: {' '.join(cmd[:8])}...")
+
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                if result.returncode != 0:
+                    return {'success': False, 'error': result.stderr, 'tool': 'streme'}
+                return self._parse_streme(output_path)
+            except Exception as e:
+                return {'success': False, 'error': str(e), 'tool': 'streme'}
+
+    def run_meme(self,
+                 sequences: List[str],
+                 output_dir: str,
+                 nmotifs: int = 5,
+                 minw: int = 8,
+                 maxw: int = 30,
+                 mod: str = 'zoops') -> Dict:
+        """
+        Run MEME for ab initio motif discovery.
+
+        Finds longer, more complex motifs (8-30bp). Slower than STREME but
+        can find patterns that STREME might miss.
+
+        Args:
+            sequences: Input sequences
+            output_dir: Output directory
+            nmotifs: Number of motifs to find
+            minw/maxw: Min/max motif width
+            mod: Site distribution model:
+                 'oops' - One Occurrence Per Sequence
+                 'zoops' - Zero or One Per Sequence (default)
+                 'anr' - Any Number of Repetitions
+        """
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fasta = os.path.join(tmpdir, 'input.fa')
+            self.write_fasta(sequences, fasta)
+
+            cmd = [self.meme_path, fasta, '-oc', str(output_path),
+                   '-dna', '-nmotifs', str(nmotifs),
+                   '-minw', str(minw), '-maxw', str(maxw),
+                   '-mod', mod, '-revcomp']
+
+            print(f"    Running MEME: {' '.join(cmd[:8])}...")
+
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+                if result.returncode != 0:
+                    return {'success': False, 'error': result.stderr, 'tool': 'meme'}
+                return self._parse_meme(output_path)
+            except Exception as e:
+                return {'success': False, 'error': str(e), 'tool': 'meme'}
+
+    # ==================== Output Parsers ====================
+
+    def _parse_streme(self, output_dir: Path) -> Dict:
+        """Parse STREME output."""
+        results = {'success': True, 'tool': 'streme', 'motifs': []}
+
+        streme_txt = output_dir / 'streme.txt'
+        if streme_txt.exists():
+            with open(streme_txt, 'r') as f:
+                content = f.read()
+
+            # Extract motif consensus and stats
+            motif_pattern = r'MOTIF\s+(\S+)\s+STREME-(\d+)'
+            for consensus, motif_num in re.findall(motif_pattern, content):
+                results['motifs'].append({
+                    'consensus': consensus,
+                    'motif_id': f'STREME-{motif_num}',
+                })
+
+        if (output_dir / 'streme.html').exists():
+            results['html_report'] = str(output_dir / 'streme.html')
+
+        return results
+
+    def _parse_meme(self, output_dir: Path) -> Dict:
+        """Parse MEME output."""
+        results = {'success': True, 'tool': 'meme', 'motifs': []}
+
+        meme_txt = output_dir / 'meme.txt'
+        if meme_txt.exists():
+            with open(meme_txt, 'r') as f:
+                content = f.read()
+
+            # Extract motif summaries - simpler pattern
+            # Look for MOTIF lines
+            motif_blocks = re.split(r'MOTIF\s+', content)[1:]  # Skip header
+
+            for i, block in enumerate(motif_blocks):
+                lines = block.strip().split('\n')
+                if lines:
+                    # First line has consensus
+                    first_line = lines[0].strip()
+                    consensus = first_line.split()[0] if first_line else f'MOTIF-{i + 1}'
+
+                    # Try to extract width and E-value
+                    width = None
+                    evalue = None
+                    for line in lines[:10]:
+                        if 'width' in line.lower():
+                            match = re.search(r'width\s*=\s*(\d+)', line)
+                            if match:
+                                width = int(match.group(1))
+                        if 'e-value' in line.lower():
+                            match = re.search(r'E-value\s*=\s*([\d.e+-]+)', line, re.I)
+                            if match:
+                                evalue = match.group(1)
+
+                    results['motifs'].append({
+                        'consensus': consensus,
+                        'motif_id': f'MEME-{i + 1}',
+                        'width': width,
+                        'evalue': evalue,
+                    })
+
+        if (output_dir / 'meme.html').exists():
+            results['html_report'] = str(output_dir / 'meme.html')
+
+        return results
+
+
 class ClusterFeatureAnalyzer:
     """
     Analyze features that distinguish different clusters.
@@ -326,7 +521,7 @@ class ClusterFeatureAnalyzer:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.complexity_analyzer = SequenceComplexityAnalyzer()
-        self.streme_runner = STREMERunner()
+        self.meme_runner = MEMESuiteRunner()
 
     def compute_sequence_features(self,
                                   sequences: List[str],
@@ -373,13 +568,26 @@ class ClusterFeatureAnalyzer:
                          sequences: List[str],
                          cluster_assignments: np.ndarray,
                          sequence_ids: Optional[np.ndarray] = None,
-                         run_streme: bool = True) -> Dict:
+                         run_meme_suite: bool = True,
+                         meme_tools: List[str] = ['streme']) -> Dict:
         """
         Comprehensive analysis of cluster differences.
+
+        Args:
+            sequences: List of DNA sequences
+            cluster_assignments: Cluster label for each sequence
+            sequence_ids: Optional sequence identifiers
+            run_meme_suite: Whether to run MEME suite tools
+            meme_tools: Which tools to run: 'streme' and/or 'meme'
         """
         unique_clusters = sorted([c for c in np.unique(cluster_assignments) if c != -1])
 
         print(f"\nAnalyzing {len(unique_clusters)} clusters...")
+
+        # Check available MEME tools
+        if run_meme_suite:
+            available = self.meme_runner.get_available_tools()
+            print(f"\nAvailable MEME suite tools: {[k for k, v in available.items() if v]}")
 
         # Compute features for all sequences
         print("\nComputing sequence features...")
@@ -396,13 +604,13 @@ class ClusterFeatureAnalyzer:
         print("\nRunning statistical tests...")
         pairwise_tests = self._run_pairwise_tests(features_df, unique_clusters)
 
-        # Run STREME if available
-        streme_results = {}
-        if run_streme and self.streme_runner.check_streme_available():
-            print("\nRunning STREME motif discovery...")
-            streme_results = self._run_cluster_streme(sequences, cluster_assignments, unique_clusters)
-        elif run_streme:
-            print("\nSTREME not available, skipping motif discovery")
+        # Run MEME suite tools
+        meme_results = {}
+        if run_meme_suite:
+            print("\nRunning MEME suite analysis...")
+            meme_results = self._run_meme_suite_analysis(
+                sequences, cluster_assignments, unique_clusters, meme_tools
+            )
 
         # Identify distinguishing features
         distinguishing_features = self._identify_distinguishing_features(
@@ -413,9 +621,56 @@ class ClusterFeatureAnalyzer:
             'features_df': features_df,
             'cluster_stats': cluster_stats,
             'pairwise_tests': pairwise_tests,
-            'streme_results': streme_results,
+            'meme_results': meme_results,
             'distinguishing_features': distinguishing_features,
         }
+
+        return results
+
+    def _run_meme_suite_analysis(self,
+                                 sequences: List[str],
+                                 cluster_assignments: np.ndarray,
+                                 clusters: List[int],
+                                 tools: List[str]) -> Dict:
+        """Run requested MEME suite tools for each cluster."""
+        results = {}
+
+        for cluster in clusters:
+            print(f"\n  Analyzing cluster {cluster}...")
+            cluster_results = {}
+
+            # Get cluster and other sequences
+            cluster_seqs = [sequences[i] for i in range(len(sequences))
+                            if cluster_assignments[i] == cluster]
+            other_seqs = [sequences[i] for i in range(len(sequences))
+                          if cluster_assignments[i] != cluster and cluster_assignments[i] != -1]
+
+            # Sample if too many sequences
+            if len(cluster_seqs) > 1000:
+                idx = np.random.choice(len(cluster_seqs), 1000, replace=False)
+                cluster_seqs = [cluster_seqs[i] for i in idx]
+
+            if len(other_seqs) > 2000:
+                idx = np.random.choice(len(other_seqs), 2000, replace=False)
+                other_seqs = [other_seqs[i] for i in idx]
+
+            # Run STREME (fast, discriminative)
+            if 'streme' in tools:
+                output_dir = self.output_dir / f'streme_cluster_{cluster}'
+                cluster_results['streme'] = self.meme_runner.run_streme(
+                    cluster_seqs, other_seqs, str(output_dir)
+                )
+
+            # Run MEME (slower, finds longer/complex motifs)
+            if 'meme' in tools:
+                output_dir = self.output_dir / f'meme_cluster_{cluster}'
+                # Use smaller sample for MEME (slower)
+                meme_seqs = cluster_seqs[:500] if len(cluster_seqs) > 500 else cluster_seqs
+                cluster_results['meme'] = self.meme_runner.run_meme(
+                    meme_seqs, str(output_dir), nmotifs=5
+                )
+
+            results[cluster] = cluster_results
 
         return results
 
@@ -737,16 +992,37 @@ class ClusterFeatureAnalyzer:
         for feat, pval in results['distinguishing_features']['ranked_features'][:10]:
             report_lines.append(f"  {feat}: p = {pval:.2e}")
 
-        # STREME results
-        if results['streme_results']:
-            report_lines.append("\n\n## STREME MOTIF DISCOVERY\n")
-            for cluster, streme in results['streme_results'].items():
+        # MEME suite results
+        if results.get('meme_results'):
+            report_lines.append("\n\n## MOTIF ANALYSIS\n")
+            for cluster, tools_results in results['meme_results'].items():
                 report_lines.append(f"\n### Cluster {cluster}")
-                if streme.get('success'):
-                    for motif in streme.get('motifs', [])[:5]:
-                        report_lines.append(f"  Motif: {motif['consensus']}")
-                else:
-                    report_lines.append(f"  Error: {streme.get('error', 'Unknown')}")
+
+                # STREME results
+                if 'streme' in tools_results:
+                    streme = tools_results['streme']
+                    report_lines.append("\n  STREME (discriminative short motifs):")
+                    if streme.get('success'):
+                        for motif in streme.get('motifs', [])[:5]:
+                            report_lines.append(f"    - {motif['consensus']}")
+                        if streme.get('html_report'):
+                            report_lines.append(f"    Full report: {streme['html_report']}")
+                    else:
+                        report_lines.append(f"    Error: {streme.get('error', 'Unknown')}")
+
+                # MEME results
+                if 'meme' in tools_results:
+                    meme = tools_results['meme']
+                    report_lines.append("\n  MEME (complex/longer motifs):")
+                    if meme.get('success'):
+                        for motif in meme.get('motifs', [])[:5]:
+                            width_str = f", width={motif.get('width')}" if motif.get('width') else ""
+                            evalue_str = f", E={motif.get('evalue')}" if motif.get('evalue') else ""
+                            report_lines.append(f"    - {motif['consensus']}{width_str}{evalue_str}")
+                        if meme.get('html_report'):
+                            report_lines.append(f"    Full report: {meme['html_report']}")
+                    else:
+                        report_lines.append(f"    Error: {meme.get('error', 'Unknown')}")
 
         report_text = '\n'.join(report_lines)
 
@@ -794,21 +1070,31 @@ def load_sequences_and_clusters(sequences_file: str,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='STREME Motif Discovery and Cluster Feature Analysis',
+        description='MEME Suite Motif Discovery and Cluster Feature Analysis',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Analyze clusters with STREME
+  # Basic analysis with STREME only (fast, default)
   python 03_cluster_feature_analysis.py \\
       --sequences data/all_sequences.txt \\
       --clusters umap_results/cluster_assignments.csv \\
       --output cluster_analysis/
 
-  # Skip STREME (faster)
+  # Include MEME for longer/complex motifs (slower)
   python 03_cluster_feature_analysis.py \\
       --sequences data/sequences.txt \\
       --clusters clusters.csv \\
-      --no-streme
+      --meme-tools streme meme
+
+  # Skip all MEME suite tools (sequence features only)
+  python 03_cluster_feature_analysis.py \\
+      --sequences data/sequences.txt \\
+      --clusters clusters.csv \\
+      --no-meme
+
+MEME suite tools:
+  streme - Fast discriminative motif discovery (6-15bp, default)
+  meme   - Classic motif discovery (8-30bp, slower but finds complex motifs)
         """
     )
 
@@ -818,8 +1104,14 @@ Examples:
                         help='Path to cluster assignments CSV')
     parser.add_argument('--output', '-o', default='cluster_analysis',
                         help='Output directory')
-    parser.add_argument('--no-streme', action='store_true',
-                        help='Skip STREME motif discovery')
+
+    # MEME suite options
+    parser.add_argument('--no-meme', action='store_true',
+                        help='Skip all MEME suite tools')
+    parser.add_argument('--meme-tools', nargs='+',
+                        choices=['streme', 'meme'],
+                        default=['streme'],
+                        help='Which MEME suite tools to run (default: streme)')
 
     args = parser.parse_args()
 
@@ -836,7 +1128,8 @@ Examples:
         sequences,
         cluster_assignments,
         sequence_ids,
-        run_streme=not args.no_streme
+        run_meme_suite=not args.no_meme,
+        meme_tools=args.meme_tools
     )
 
     # Generate visualizations
@@ -858,10 +1151,25 @@ Examples:
     features_file = Path(args.output) / 'sequence_features.csv'
     results['features_df'].to_csv(features_file, index=False)
 
-    # Save cluster statistics as JSON
+    # Save cluster statistics as JSON (convert numpy types to Python types)
+    def convert_numpy_types(obj):
+        """Recursively convert numpy types to Python types for JSON serialization."""
+        if isinstance(obj, dict):
+            return {str(k): convert_numpy_types(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_numpy_types(v) for v in obj]
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        else:
+            return obj
+
     stats_file = Path(args.output) / 'cluster_statistics.json'
     with open(stats_file, 'w') as f:
-        json.dump(results['cluster_stats'], f, indent=2)
+        json.dump(convert_numpy_types(results['cluster_stats']), f, indent=2)
 
     # Print summary
     print("\n" + "=" * 60)

@@ -166,6 +166,7 @@ def load_data(
     # Creating sequence dataset
     df = encode_data["train_df"]
     val_df = encode_data["validation_df"]
+    test_df = encode_data["test_df"]
 
     req_embedding_save_path = os.path.join(embedding_save_path, foundation_model)
     train_embed_file = os.path.join(req_embedding_save_path, f"train_embeddings{'_debug' if debug else ""}.h5")
@@ -179,6 +180,12 @@ def load_data(
         )
         embed_and_save_sequences(
             df=val_df,
+            chunk_size=200,
+            output_file=val_embed_file,
+            debug=debug
+        )
+        embed_and_save_sequences(
+            df=test_df,
             chunk_size=200,
             output_file=val_embed_file,
             debug=debug

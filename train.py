@@ -113,6 +113,8 @@ def train(
                     "epoch": epoch,
                     "global_step": global_step,
                     "val_loss": best_val_loss,
+                    "mu": model.mu,
+                    "sd": model.sd,
                 }
                 checkpoint_file = f"checkpoints/model_epoch{epoch}_step{global_step}_valloss_{best_val_loss:2f}.pt"
                 torch.save(

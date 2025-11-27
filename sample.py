@@ -27,6 +27,10 @@ def sample(
             else torch.load(checkpoint_path, map_location="cpu")
         )
         model.model.load_state_dict(checkpoint_dict["model"])
+        model.mu = checkpoint_dict["mu"]
+        model.sd = checkpoint_dict["sd"]
+
+    assert model.mu.sum() > 0 and model.sd.sum() > 0, "Mu and SD must be non-zero"
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
@@ -56,8 +60,8 @@ def sample(
 def main(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
     model = hydra.utils.instantiate(cfg.model)
-    data, train_mu,train_sd = hydra.utils.instantiate(cfg.data)
-    diffusion = hydra.utils.instantiate(cfg.diffusion, model=model, mu=train_mu, sd=train_sd)
+    data, _, _ = hydra.utils.instantiate(cfg.data)
+    diffusion = hydra.utils.instantiate(cfg.diffusion, model=model, mu=torch.zeros(4), sd=torch.zeros(4))
 
     sample(
         data=data,

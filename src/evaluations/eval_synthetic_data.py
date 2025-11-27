@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from collections import Counter, defaultdict
 from typing import List, Dict, Tuple, Optional
-from scipy.stats import entropy, ks_2samp, wasserstein_distance
+from scipy.stats import entropy, ks_2samp, wasserstein_distance, ttest_ind
 from scipy.spatial.distance import jensenshannon
 import warnings
 from dataclasses import dataclass
@@ -38,6 +38,8 @@ class DNASequenceEvaluator:
 
     def __init__(self,
                  kmer_sizes: List[int] = [3, 4, 5],
+                 novelty_radii: List[int] = [1, 2, 3, 5],
+                 sequence_length: int = 200,
                  bootstrap_config: Optional[BootstrapConfig] = None,
                  verbose: bool = True):
         """
@@ -45,10 +47,14 @@ class DNASequenceEvaluator:
 
         Args:
             kmer_sizes: List of k-mer sizes to analyze (default: [3, 4, 5])
+            novelty_radii: List of radius values for novelty@r calculation (default: [1, 2, 3, 5])
+            sequence_length: Expected sequence length for normalization (default: 200)
             bootstrap_config: Configuration for bootstrapping (default: 1000 iterations, 95% CI)
             verbose: Whether to print progress messages
         """
         self.kmer_sizes = kmer_sizes
+        self.novelty_radii = novelty_radii
+        self.sequence_length = sequence_length
         self.bootstrap_config = bootstrap_config or BootstrapConfig()
         self.verbose = verbose
 
@@ -98,6 +104,8 @@ class DNASequenceEvaluator:
                 'n_test': len(test_sequences),
                 'n_synthetic': len(synthetic_sequences),
                 'kmer_sizes': self.kmer_sizes,
+                'novelty_radii': self.novelty_radii,
+                'sequence_length': self.sequence_length,
                 'bootstrap_iterations': self.bootstrap_config.n_bootstrap if enable_bootstrap else 0,
                 'confidence_level': self.bootstrap_config.confidence_level
             }
@@ -113,26 +121,20 @@ class DNASequenceEvaluator:
         """Compute all metrics (point estimates)."""
         results = {}
 
-        # 1. GC Content Comparison
+        # 1. GC Content Comparison (difference metrics only)
         results['gc_content'] = self._evaluate_gc_content(test_seqs, synth_seqs)
 
         # 2. K-mer Frequency Comparison
         results['kmer_analysis'] = self._evaluate_kmer_frequencies(test_seqs, synth_seqs)
 
-        # 3. Novelty Metrics
+        # 3. Novelty Metrics (Novelty@r)
         results['novelty'] = self._evaluate_novelty(test_seqs, synth_seqs)
 
-        # 4. Diversity Metrics
+        # 4. Diversity Metrics (Mean pairwise normalized Hamming distance)
         results['diversity'] = self._evaluate_diversity(synth_seqs)
 
-        # 5. Sequence Length Statistics
-        results['length_stats'] = self._evaluate_length_distribution(test_seqs, synth_seqs)
-
-        # 6. Nucleotide Distribution
+        # 5. Nucleotide Distribution
         results['nucleotide_dist'] = self._evaluate_nucleotide_distribution(test_seqs, synth_seqs)
-
-        # 7. Entropy Metrics
-        results['entropy'] = self._evaluate_entropy(test_seqs, synth_seqs)
 
         return results
 
@@ -149,6 +151,8 @@ class DNASequenceEvaluator:
         bootstrap_samples = defaultdict(list)
 
         for i in tqdm(range(n_bootstrap)):
+            if self.verbose and (i + 1) % 100 == 0:
+                print(f"  Bootstrap iteration {i + 1}/{n_bootstrap}")
 
             # Resample with replacement
             test_sample = self._resample(test_seqs)
@@ -176,8 +180,8 @@ class DNASequenceEvaluator:
 
     def _extract_bootstrap_metrics(self, results: Dict, bootstrap_samples: Dict):
         """Extract key metrics from results for bootstrap sampling."""
-        # GC Content
-        bootstrap_samples['gc_content_diff'].append(results['gc_content']['mean_absolute_difference'])
+        # GC Content differences
+        bootstrap_samples['gc_mean_diff'].append(results['gc_content']['mean_difference'])
         bootstrap_samples['gc_wasserstein'].append(results['gc_content']['wasserstein_distance'])
 
         # K-mer metrics
@@ -191,18 +195,14 @@ class DNASequenceEvaluator:
                     results['kmer_analysis'][key]['cosine_similarity']
                 )
 
-        # Novelty
-        bootstrap_samples['exact_match_ratio'].append(results['novelty']['exact_match_ratio'])
-        bootstrap_samples['min_edit_distance'].append(results['novelty']['min_edit_distance_mean'])
+        # Novelty@r
+        for r in self.novelty_radii:
+            key = f'novelty@{r}'
+            if key in results['novelty']:
+                bootstrap_samples[f'novelty_r{r}'].append(results['novelty'][key])
 
         # Diversity
-        bootstrap_samples['unique_sequences_ratio'].append(results['diversity']['unique_sequences_ratio'])
-        bootstrap_samples['self_bleu'].append(results['diversity']['self_bleu_mean'])
-        bootstrap_samples['distinct_2'].append(results['diversity']['distinct-2'])
-        bootstrap_samples['pairwise_edit_distance'].append(results['diversity']['pairwise_edit_distance_mean'])
-
-        # Length
-        bootstrap_samples['length_ks_statistic'].append(results['length_stats']['ks_statistic'])
+        bootstrap_samples['diversity'].append(results['diversity']['mean_pairwise_hamming'])
 
         # Nucleotide distribution
         bootstrap_samples['nucleotide_jsd'].append(
@@ -210,7 +210,7 @@ class DNASequenceEvaluator:
         )
 
     def _results_to_dataframe(self, results: Dict, bootstrap_results: Dict,
-                             enable_bootstrap: bool) -> pd.DataFrame:
+                              enable_bootstrap: bool) -> pd.DataFrame:
         """Convert results to a pandas DataFrame."""
         rows = []
 
@@ -240,16 +240,14 @@ class DNASequenceEvaluator:
 
             rows.append(row)
 
-        # GC Content
+        # GC Content (difference metrics only)
         gc = results['gc_content']
-        add_row('GC Content', 'Test Mean', gc['test_mean'], '%', 'Reference baseline')
-        add_row('GC Content', 'Synthetic Mean', gc['synthetic_mean'], '%', 'Generated sequences')
-        add_row('GC Content', 'Absolute Difference', gc['mean_absolute_difference'], '%',
-                'Lower is better (closer to test)')
+        add_row('GC Content', 'Mean Difference', gc['mean_difference'], '%',
+                'Difference in GC% (synthetic - test); closer to 0 is better')
         add_row('GC Content', 'Wasserstein Distance', gc['wasserstein_distance'], '',
-                'Lower is better (similar distribution)')
-        add_row('GC Content', 'KS Test p-value', gc['ks_pvalue'], '',
-                'Higher is better (p>0.05 = similar)')
+                'Distribution distance; lower is better')
+        add_row('GC Content', 'T-test p-value', gc['ttest_pvalue'], '',
+                'p>0.05 indicates no significant difference')
 
         # K-mer Analysis
         for k, metrics in results['kmer_analysis'].items():
@@ -260,40 +258,26 @@ class DNASequenceEvaluator:
             add_row('K-mer Analysis', f'{k} Overlap Ratio', metrics['overlap_ratio'], '',
                     'Higher is better (shared k-mers)')
 
-        # Novelty
+        # Novelty@r
         nov = results['novelty']
-        add_row('Novelty', 'Exact Match Ratio', nov['exact_match_ratio'], '',
-                'Lower is better (less memorization)')
-        add_row('Novelty', 'Min Edit Distance Mean', nov['min_edit_distance_mean'], 'bp',
-                'Higher is better (more novel)')
-        add_row('Novelty', 'Min Edit Distance Std', nov['min_edit_distance_std'], 'bp',
-                'Variability in novelty')
+        for r in self.novelty_radii:
+            key = f'novelty@{r}'
+            if key in nov:
+                add_row('Novelty', f'Novelty@{r}', nov[key], '',
+                        f'Fraction of synthetics with min Hamming distance > {r} from train set; higher is better')
 
         # Diversity
         div = results['diversity']
-        add_row('Diversity', 'Unique Sequences Ratio', div['unique_sequences_ratio'], '',
-                'Higher is better (more diverse)')
-        add_row('Diversity', 'Self-BLEU Mean', div['self_bleu_mean'], '',
-                'Lower is better (less self-similar)')
-        add_row('Diversity', 'Distinct-1', div['distinct-1'], '',
-                'Higher is better (unique 1-mers)')
-        add_row('Diversity', 'Distinct-2', div['distinct-2'], '',
-                'Higher is better (unique 2-mers)')
-        add_row('Diversity', 'Distinct-3', div['distinct-3'], '',
-                'Higher is better (unique 3-mers)')
-        add_row('Diversity', 'Pairwise Edit Distance Mean', div['pairwise_edit_distance_mean'], 'bp',
-                'Higher is better (more diverse)')
-        add_row('Diversity', 'Sequence Entropy', div['sequence_entropy'], 'bits',
-                'Higher is better (more varied)')
+        add_row('Diversity', 'Mean Pairwise Hamming Distance', div['mean_pairwise_hamming'], '',
+                'Higher is better (more diverse); normalized by sequence length')
+        add_row('Diversity', 'Std Pairwise Hamming Distance', div['std_pairwise_hamming'], '',
+                'Variability in diversity')
 
-        # Length Statistics
-        length = results['length_stats']
-        add_row('Length', 'Test Mean', length['test_mean'], 'bp', 'Reference baseline')
-        add_row('Length', 'Synthetic Mean', length['synthetic_mean'], 'bp', 'Generated sequences')
-        add_row('Length', 'KS Test Statistic', length['ks_statistic'], '',
-                'Lower is better (similar distribution)')
-        add_row('Length', 'KS Test p-value', length['ks_pvalue'], '',
-                'Higher is better (p>0.05 = similar)')
+        # Additional diversity metrics
+        add_row('Diversity', 'Unique Sequences Ratio', div['unique_sequences_ratio'], '',
+                'Higher is better (no duplicates = 1.0)')
+        add_row('Diversity', 'Shannon Entropy', div['sequence_entropy'], 'bits',
+                'Higher is better (more varied sequences)')
 
         # Nucleotide Distribution
         nuc = results['nucleotide_dist']
@@ -315,15 +299,9 @@ class DNASequenceEvaluator:
     def _get_bootstrap_key(self, category: str, metric: str) -> str:
         """Map category and metric to bootstrap result key."""
         mapping = {
-            ('GC Content', 'Absolute Difference'): 'gc_content_diff',
+            ('GC Content', 'Mean Difference'): 'gc_mean_diff',
             ('GC Content', 'Wasserstein Distance'): 'gc_wasserstein',
-            ('Novelty', 'Exact Match Ratio'): 'exact_match_ratio',
-            ('Novelty', 'Min Edit Distance Mean'): 'min_edit_distance',
-            ('Diversity', 'Unique Sequences Ratio'): 'unique_sequences_ratio',
-            ('Diversity', 'Self-BLEU Mean'): 'self_bleu',
-            ('Diversity', 'Distinct-2'): 'distinct_2',
-            ('Diversity', 'Pairwise Edit Distance Mean'): 'pairwise_edit_distance',
-            ('Length', 'KS Test Statistic'): 'length_ks_statistic',
+            ('Diversity', 'Mean Pairwise Hamming Distance'): 'diversity',
             ('Nucleotide Distribution', 'JS Divergence'): 'nucleotide_jsd',
         }
 
@@ -331,6 +309,10 @@ class DNASequenceEvaluator:
         for k in self.kmer_sizes:
             mapping[(f'K-mer Analysis', f'{k}-mer JS Divergence')] = f'kmer_{k}_jsd'
             mapping[(f'K-mer Analysis', f'{k}-mer Cosine Similarity')] = f'kmer_{k}_cosine'
+
+        # Handle novelty@r
+        for r in self.novelty_radii:
+            mapping[(f'Novelty', f'Novelty@{r}')] = f'novelty_r{r}'
 
         return mapping.get((category, metric), '')
 
@@ -362,22 +344,22 @@ class DNASequenceEvaluator:
         indices = np.random.choice(len(sequences), size=len(sequences), replace=True)
         return [sequences[i] for i in indices]
 
-    # ==================== Original Metric Methods ====================
+    # ==================== Metric Computation Methods ====================
 
     def _evaluate_gc_content(self, test_seqs: List[str], synth_seqs: List[str]) -> Dict:
-        """Evaluate GC content comparison between test and synthetic sequences."""
-        test_gc = [self._compute_gc_content(seq) for seq in test_seqs]
-        synth_gc = [self._compute_gc_content(seq) for seq in synth_seqs]
+        """Evaluate GC content - return difference metrics only."""
+        test_gc = np.array([self._compute_gc_content(seq) for seq in test_seqs])
+        synth_gc = np.array([self._compute_gc_content(seq) for seq in synth_seqs])
+
+        # T-test for statistical significance
+        ttest_result = ttest_ind(test_gc, synth_gc)
 
         return {
-            'test_mean': np.mean(test_gc),
-            'test_std': np.std(test_gc),
-            'synthetic_mean': np.mean(synth_gc),
-            'synthetic_std': np.std(synth_gc),
-            'mean_absolute_difference': abs(np.mean(test_gc) - np.mean(synth_gc)),
-            'ks_statistic': ks_2samp(test_gc, synth_gc).statistic,
-            'ks_pvalue': ks_2samp(test_gc, synth_gc).pvalue,
-            'wasserstein_distance': wasserstein_distance(test_gc, synth_gc)
+            'mean_difference': np.mean(synth_gc) - np.mean(test_gc),
+            'std_difference': np.sqrt(np.var(test_gc) + np.var(synth_gc)),
+            'wasserstein_distance': wasserstein_distance(test_gc, synth_gc),
+            'ttest_statistic': ttest_result.statistic,
+            'ttest_pvalue': ttest_result.pvalue
         }
 
     def _evaluate_kmer_frequencies(self, test_seqs: List[str], synth_seqs: List[str]) -> Dict:
@@ -408,94 +390,76 @@ class DNASequenceEvaluator:
         return results
 
     def _evaluate_novelty(self, test_seqs: List[str], synth_seqs: List[str]) -> Dict:
-        """Evaluate novelty of synthetic sequences."""
-        # 1. Exact match ratio
-        exact_matches = sum(1 for seq in synth_seqs if seq in test_seqs)
+        """
+        Evaluate novelty using Novelty@r metric.
 
-        # 2. Minimum edit distance to training set
-        min_edit_distances = []
-        for synth_seq in synth_seqs:
-            min_dist = min(self._edit_distance(synth_seq, test_seq) for test_seq in test_seqs)
-            min_edit_distances.append(min_dist)
+        Novelty@r = (1/|S|) * sum_{x in S} I[min_{y in T} d_H(x,y) > r]
+        where d_H is Hamming distance, S is synthetic set, T is test set, r is radius
+        """
+        results = {}
 
-        # 3. K-mer novelty (percentage of k-mers not in test set)
-        kmer_novelty = {}
-        for k in self.kmer_sizes:
-            test_kmers = set()
-            for seq in test_seqs:
-                test_kmers.update(self._get_kmers(seq, k))
+        # Compute minimum Hamming distance for each synthetic sequence
+        min_hamming_distances = []
+        for synth_seq in tqdm(synth_seqs,desc='Computing min Hamming distances for novelty'):
+            min_dist = min(self._hamming_distance(synth_seq, test_seq) for test_seq in test_seqs)
+            min_hamming_distances.append(min_dist)
 
-            novel_kmer_counts = []
-            for seq in synth_seqs:
-                synth_kmers = set(self._get_kmers(seq, k))
-                novel_count = len(synth_kmers - test_kmers)
-                novel_kmer_counts.append(novel_count / (len(synth_kmers) + 1e-10))
+        min_hamming_distances = np.array(min_hamming_distances)
 
-            kmer_novelty[f'{k}-mer_novelty'] = np.mean(novel_kmer_counts)
+        # Compute Novelty@r for each radius
+        for r in self.novelty_radii:
+            novelty_at_r = np.mean(min_hamming_distances > r)
+            results[f'novelty@{r}'] = novelty_at_r
 
-        return {
-            'exact_match_ratio': exact_matches / len(synth_seqs),
-            'min_edit_distance_mean': np.mean(min_edit_distances),
-            'min_edit_distance_median': np.median(min_edit_distances),
-            'min_edit_distance_std': np.std(min_edit_distances),
-            **kmer_novelty
-        }
+        # Store min distances for additional analysis
+        results['min_hamming_mean'] = np.mean(min_hamming_distances)
+        results['min_hamming_std'] = np.std(min_hamming_distances)
+        results['min_hamming_median'] = np.median(min_hamming_distances)
+
+        return results
 
     def _evaluate_diversity(self, synth_seqs: List[str]) -> Dict:
-        """Evaluate diversity within synthetic sequences."""
-        # 1. Unique sequences ratio
+        """
+        Evaluate diversity using mean pairwise normalized Hamming distance.
+
+        Div = (2 / (|S|(|S|-1))) * sum_{i<j} (d_H(x_i, x_j) / L)
+        where L is sequence length
+        """
+        n = len(synth_seqs)
+
+        if n < 2:
+            return {
+                'mean_pairwise_hamming': 0.0,
+                'std_pairwise_hamming': 0.0,
+                'unique_sequences_ratio': 1.0,
+                'sequence_entropy': 0.0
+            }
+
+        # Compute all pairwise Hamming distances (normalized)
+        pairwise_distances = []
+        with tqdm(total=n * (n - 1) // 2, desc='Computing pairwise Hamming distances for diversity') as pbar:
+            for i in range(n):
+                for j in range(i + 1, n):
+                    dist = self._hamming_distance(synth_seqs[i], synth_seqs[j])
+                    normalized_dist = dist / self.sequence_length
+                    pairwise_distances.append(normalized_dist)
+                    pbar.update(1)
+
+        pairwise_distances = np.array(pairwise_distances)
+
+        # Unique sequences ratio
         unique_ratio = len(set(synth_seqs)) / len(synth_seqs)
 
-        # 2. Self-BLEU (lower is more diverse)
-        self_bleu_scores = []
-        for i, seq in enumerate(synth_seqs):
-            other_seqs = synth_seqs[:i] + synth_seqs[i+1:]
-            if other_seqs:
-                bleu = self._compute_self_bleu(seq, other_seqs, n=4)
-                self_bleu_scores.append(bleu)
-
-        # 3. Distinct-n (higher is more diverse)
-        distinct_n = {}
-        for n in [1, 2, 3]:
-            distinct_n[f'distinct-{n}'] = self._compute_distinct_n(synth_seqs, n)
-
-        # 4. Pairwise edit distance (sample for efficiency)
-        sample_size = min(100, len(synth_seqs))
-        sample_indices = np.random.choice(len(synth_seqs), sample_size, replace=False)
-        pairwise_dists = []
-        for i in range(len(sample_indices)):
-            for j in range(i+1, len(sample_indices)):
-                dist = self._edit_distance(synth_seqs[sample_indices[i]],
-                                          synth_seqs[sample_indices[j]])
-                pairwise_dists.append(dist)
-
-        # 5. Entropy of sequences
+        # Sequence entropy
         seq_counter = Counter(synth_seqs)
         seq_probs = np.array(list(seq_counter.values())) / len(synth_seqs)
         sequence_entropy = entropy(seq_probs)
 
         return {
+            'mean_pairwise_hamming': np.mean(pairwise_distances),
+            'std_pairwise_hamming': np.std(pairwise_distances),
             'unique_sequences_ratio': unique_ratio,
-            'self_bleu_mean': np.mean(self_bleu_scores) if self_bleu_scores else 0,
-            'self_bleu_std': np.std(self_bleu_scores) if self_bleu_scores else 0,
-            **distinct_n,
-            'pairwise_edit_distance_mean': np.mean(pairwise_dists) if pairwise_dists else 0,
-            'pairwise_edit_distance_std': np.std(pairwise_dists) if pairwise_dists else 0,
             'sequence_entropy': sequence_entropy
-        }
-
-    def _evaluate_length_distribution(self, test_seqs: List[str], synth_seqs: List[str]) -> Dict:
-        """Evaluate sequence length distributions."""
-        test_lengths = [len(seq) for seq in test_seqs]
-        synth_lengths = [len(seq) for seq in synth_seqs]
-
-        return {
-            'test_mean': np.mean(test_lengths),
-            'test_std': np.std(test_lengths),
-            'synthetic_mean': np.mean(synth_lengths),
-            'synthetic_std': np.std(synth_lengths),
-            'ks_statistic': ks_2samp(test_lengths, synth_lengths).statistic,
-            'ks_pvalue': ks_2samp(test_lengths, synth_lengths).pvalue
         }
 
     def _evaluate_nucleotide_distribution(self, test_seqs: List[str], synth_seqs: List[str]) -> Dict:
@@ -514,17 +478,6 @@ class DNASequenceEvaluator:
             'total_variation_distance': 0.5 * np.sum(np.abs(test_freq - synth_freq))
         }
 
-    def _evaluate_entropy(self, test_seqs: List[str], synth_seqs: List[str]) -> Dict:
-        """Evaluate various entropy measures."""
-        # Positional entropy (if sequences have same length)
-        test_pos_entropy = self._compute_positional_entropy(test_seqs)
-        synth_pos_entropy = self._compute_positional_entropy(synth_seqs)
-
-        return {
-            'test_positional_entropy_mean': np.mean(test_pos_entropy) if test_pos_entropy else None,
-            'synthetic_positional_entropy_mean': np.mean(synth_pos_entropy) if synth_pos_entropy else None,
-        }
-
     # ==================== Helper Methods ====================
 
     @staticmethod
@@ -535,9 +488,19 @@ class DNASequenceEvaluator:
         return gc_count / len(seq) if len(seq) > 0 else 0
 
     @staticmethod
+    def _hamming_distance(seq1: str, seq2: str) -> int:
+        """
+        Compute Hamming distance between two sequences.
+        Assumes sequences are of equal length.
+        """
+        if len(seq1) != len(seq2):
+            raise ValueError(f"Sequences must be of equal length. Got {len(seq1)} and {len(seq2)}")
+        return sum(c1 != c2 for c1, c2 in zip(seq1.upper(), seq2.upper()))
+
+    @staticmethod
     def _get_kmers(seq: str, k: int) -> List[str]:
         """Extract all k-mers from a sequence."""
-        return [seq[i:i+k] for i in range(len(seq) - k + 1)]
+        return [seq[i:i + k] for i in range(len(seq) - k + 1)]
 
     def _get_kmer_distribution(self, sequences: List[str], k: int) -> Dict[str, float]:
         """Get normalized k-mer frequency distribution."""
@@ -559,27 +522,6 @@ class DNASequenceEvaluator:
         return {nuc: count / total for nuc, count in nucleotide_counts.items()}
 
     @staticmethod
-    def _edit_distance(seq1: str, seq2: str) -> int:
-        """Compute Levenshtein edit distance."""
-        if len(seq1) < len(seq2):
-            return DNASequenceEvaluator._edit_distance(seq2, seq1)
-
-        if len(seq2) == 0:
-            return len(seq1)
-
-        previous_row = range(len(seq2) + 1)
-        for i, c1 in enumerate(seq1):
-            current_row = [i + 1]
-            for j, c2 in enumerate(seq2):
-                insertions = previous_row[j + 1] + 1
-                deletions = current_row[j] + 1
-                substitutions = previous_row[j] + (c1 != c2)
-                current_row.append(min(insertions, deletions, substitutions))
-            previous_row = current_row
-
-        return previous_row[-1]
-
-    @staticmethod
     def _cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
         """Compute cosine similarity between two vectors."""
         dot_product = np.dot(vec1, vec2)
@@ -587,60 +529,11 @@ class DNASequenceEvaluator:
         norm2 = np.linalg.norm(vec2)
         return dot_product / (norm1 * norm2 + 1e-10)
 
-    def _compute_self_bleu(self, seq: str, other_seqs: List[str], n: int = 4) -> float:
-        """Compute self-BLEU score for a sequence against others."""
-        ref_ngrams = [Counter(self._get_kmers(s.upper(), n)) for s in other_seqs]
-        hyp_ngrams = Counter(self._get_kmers(seq.upper(), n))
-
-        if not hyp_ngrams or not ref_ngrams:
-            return 0.0
-
-        scores = []
-        for ref in ref_ngrams:
-            matches = sum(min(hyp_ngrams[ng], ref[ng]) for ng in hyp_ngrams)
-            total = sum(hyp_ngrams.values())
-            scores.append(matches / total if total > 0 else 0)
-
-        return np.mean(scores)
-
-    def _compute_distinct_n(self, sequences: List[str], n: int) -> float:
-        """Compute distinct-n metric (ratio of unique n-grams)."""
-        all_ngrams = []
-        for seq in sequences:
-            all_ngrams.extend(self._get_kmers(seq.upper(), n))
-
-        if not all_ngrams:
-            return 0.0
-
-        return len(set(all_ngrams)) / len(all_ngrams)
-
-    @staticmethod
-    def _compute_positional_entropy(sequences: List[str]) -> List[float]:
-        """Compute entropy at each position (for equal-length sequences)."""
-        if not sequences:
-            return []
-
-        # Check if all sequences have same length
-        lengths = [len(s) for s in sequences]
-        if len(set(lengths)) > 1:
-            return []  # Can't compute positional entropy for variable lengths
-
-        seq_length = lengths[0]
-        entropies = []
-
-        for pos in range(seq_length):
-            nucleotides = [seq[pos].upper() for seq in sequences]
-            counts = Counter(nucleotides)
-            probs = np.array(list(counts.values())) / len(nucleotides)
-            entropies.append(entropy(probs))
-
-        return entropies
-
     def _print_summary(self, df: pd.DataFrame):
         """Print a summary of evaluation results from DataFrame."""
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("EVALUATION SUMMARY WITH CONFIDENCE INTERVALS")
-        print("="*80)
+        print("=" * 80)
 
         # Print by category
         for category in df['category'].unique():
@@ -654,7 +547,10 @@ class DNASequenceEvaluator:
 
                 # Format value display
                 if isinstance(value, float):
-                    value_str = f"{value:.4f}"
+                    if abs(value) < 0.001:
+                        value_str = f"{value:.6f}"
+                    else:
+                        value_str = f"{value:.4f}"
                 else:
                     value_str = str(value)
 
@@ -667,16 +563,14 @@ class DNASequenceEvaluator:
                     trust_str = ""
 
                 print(f"  {metric_name}: {value_str} {unit}{ci_str}{trust_str}")
-                if row['interpretation']:
-                    print(f"    → {row['interpretation']}")
 
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("\nTrustworthiness Guide:")
         print("  High: Standard error < 5% of value (very reliable)")
         print("  Medium: Standard error 5-15% of value (reasonably reliable)")
         print("  Low: Standard error 15-30% of value (interpret with caution)")
         print("  Very Low: Standard error > 30% of value (unreliable, need more data)")
-        print("="*80 + "\n")
+        print("=" * 80 + "\n")
 
 
 # Example usage
@@ -684,42 +578,23 @@ if __name__ == "__main__":
     # Example test sequences
     np.random.seed(42)
 
-    # Generate more realistic example data
-    def generate_random_dna(length, gc_content=0.5):
-        """Generate random DNA sequence with specified GC content."""
-        seq = []
-        for _ in range(length):
-            if np.random.random() < gc_content:
-                seq.append(np.random.choice(['G', 'C']))
-            else:
-                seq.append(np.random.choice(['A', 'T']))
-        return ''.join(seq)
-
-    # Create test dataset
-    test_sequences = [generate_random_dna(50, gc_content=0.52) for _ in range(100)]
-
-    # Create synthetic dataset (slightly different GC content, some duplicates)
-    synthetic_sequences = [generate_random_dna(50, gc_content=0.48) for _ in range(80)]
-    # Add some exact matches to test novelty
-    synthetic_sequences.extend(test_sequences[:5])
-    # Add some duplicates to test diversity
-    synthetic_sequences.extend([synthetic_sequences[0]] * 3)
-
-    print("="*80)
-    print("DNA SEQUENCE EVALUATION EXAMPLE")
-    print("="*80)
-    print(f"\nTest sequences: {len(test_sequences)}")
-    print(f"Synthetic sequences: {len(synthetic_sequences)}")
-    print("\nNote: This example uses 100 bootstrap iterations for speed.")
-    print("For publication-quality results, use 1000+ iterations.\n")
-
-    # Initialize evaluator with fewer bootstrap iterations for demo
-    config = BootstrapConfig(n_bootstrap=10, confidence_level=0.95, random_seed=42)
+    # Initialize evaluator
+    config = BootstrapConfig(n_bootstrap=8, confidence_level=0.95, random_seed=42)
     evaluator = DNASequenceEvaluator(
         kmer_sizes=[3, 4, 5],
+        novelty_radii=[1, 2, 3, 5, 10],
+        sequence_length=200,
         bootstrap_config=config,
         verbose=True
     )
+
+    test_sequences = \
+    pd.read_csv("/home/benjaminkroeger/Documents/Master/UBC/Synthetic_data/DNA-Diffusion/data/K562_hESCT0_HepG2_GM12878_12k_sequences_per_group.txt",sep="\t")["sequence"].sample(n=4000).tolist()
+    with open(
+        "/home/benjaminkroeger/Documents/Master/UBC/Synthetic_data/DNA-Diffusion/data/outputs/original_model_colab/combined_dna_diff_original_seqs.txt",
+        "r") as f:
+        synthetic_sequences = f.readlines()
+        synthetic_sequences = [x.strip() for x in synthetic_sequences]
 
     # Run evaluation
     results_df, detailed_results = evaluator.evaluate(
@@ -729,61 +604,38 @@ if __name__ == "__main__":
     )
 
     # Display DataFrame
-    print("\n" + "="*80)
-    print("RESULTS DATAFRAME (First 10 rows)")
-    print("="*80)
+    print("\n" + "=" * 80)
+    print("RESULTS DATAFRAME")
+    print("=" * 80)
     pd.set_option('display.max_columns', None)
     pd.set_option('display.width', None)
-    pd.set_option('display.max_colwidth', 30)
-    print(results_df.head(10).to_string(index=False))
+    pd.set_option('display.max_colwidth', 50)
+    print(results_df.to_string(index=False))
 
     # Save to CSV
     results_df.to_csv('dna_evaluation_results.csv', index=False)
     print("\n✓ Results saved to 'dna_evaluation_results.csv'")
 
-    # Access detailed bootstrap distributions
-    print("\n" + "="*80)
-    print("BOOTSTRAP DISTRIBUTION EXAMPLE")
-    print("="*80)
-    gc_diff_dist = detailed_results['bootstrap']['gc_content_diff']['distribution']
-    print(f"GC Content Difference Bootstrap Distribution:")
-    print(f"  Mean: {np.mean(gc_diff_dist):.4f}")
-    print(f"  Std Error: {np.std(gc_diff_dist):.4f}")
-    print(f"  95% CI: [{np.percentile(gc_diff_dist, 2.5):.4f}, {np.percentile(gc_diff_dist, 97.5):.4f}]")
-
-    # Example: Filter for high-trust metrics
-    print("\n" + "="*80)
-    print("HIGH-TRUST METRICS ONLY")
-    print("="*80)
-    high_trust = results_df[results_df['trustworthiness'] == 'High']
-    if len(high_trust) > 0:
-        print(high_trust[['category', 'metric', 'value', 'std_error', 'trustworthiness']].to_string(index=False))
-    else:
-        print("No metrics with 'High' trustworthiness in this example.")
-        print("(Increase bootstrap iterations or sample size for better precision)")
-
-    print("\n" + "="*80)
-    print("USAGE TIPS")
-    print("="*80)
+    print("\n" + "=" * 80)
+    print("KEY INTERPRETATIONS")
+    print("=" * 80)
     print("""
-1. Access results as DataFrame:
-   results_df['value']  # All metric values
-   results_df[results_df['category'] == 'Novelty']  # Filter by category
+GC Content Mean Difference: How much GC% differs (synthetic - test)
+    • Close to 0 = good match
+    • Check p-value: >0.05 means no significant difference
 
-2. Export results:
-   results_df.to_csv('results.csv')
-   results_df.to_latex('results.tex')
+Novelty@r: Fraction of sequences with min Hamming distance > r from training
+    • Novelty@1 = completely unique sequences
+    • Novelty@5 = sequences with at least 5 different positions
+    • Higher = more novel (but may indicate mode collapse if too high)
 
-3. Access bootstrap distributions:
-   detailed_results['bootstrap']['gc_content_diff']['distribution']
+Diversity (Mean Pairwise Hamming): Average normalized Hamming distance
+    • Range: [0, 1]
+    • 0 = all identical
+    • 1 = maximally different
+    • Higher = more diverse generation
 
-4. Interpret trustworthiness:
-   - High: Report with confidence
-   - Medium: Report with standard errors
-   - Low/Very Low: Need more data or report cautiously
-
-5. For publication:
-   - Use n_bootstrap >= 1000
-   - Report confidence intervals for key metrics
-   - Check trustworthiness before making strong claims
+K-mer JS Divergence: How different k-mer distributions are
+    • 0 = identical distributions
+    • Lower = better match to training distribution
     """)
