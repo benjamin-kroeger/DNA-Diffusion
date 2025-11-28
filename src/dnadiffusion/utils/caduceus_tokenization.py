@@ -1,5 +1,6 @@
 import h5py
 import torch
+from biolmai import BioLM
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForMaskedLM
 import numpy as np
@@ -19,11 +20,11 @@ _nt_tokenizer = None
 def _load_nucleotide_transformer():
     global _nt_tokenizer, _nt_model
 
-    print(f"Loading Nucleotide transformer model 'InstaDeepAI/nucleotide-transformer-v2-500m-multi-species' to device: {device}...")
+    print(f"Loading Nucleotide transformer model 'InstaDeepAI/nucleotide-transformer-500m-human-ref' to device: {device}...")
 
     # 1. Load remote code
-    tokenizer = AutoTokenizer.from_pretrained("InstaDeepAI/nucleotide-transformer-v2-500m-multi-species", trust_remote_code=True)
-    model = AutoModelForMaskedLM.from_pretrained("InstaDeepAI/nucleotide-transformer-v2-500m-multi-species", trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained("InstaDeepAI/nucleotide-transformer-500m-human-ref", trust_remote_code=True)
+    model = AutoModelForMaskedLM.from_pretrained("InstaDeepAI/nucleotide-transformer-500m-human-ref", trust_remote_code=True)
 
     # Move model to device and set to evaluation mode
     model.to(device)
@@ -67,6 +68,19 @@ def embedd_dna_sequence(seqs: list[str], model_name: str = "caduceus") -> torch.
     """
     global _caduceus_tokenizer, _caduceus_model, _nt_model, _nt_tokenizer
 
+    if model_name == "evo2":
+        response = BioLM(
+            entity="evo2-1b-base",
+            action="encode",
+            params={},
+            items=[{"sequence": seq} for seq in seqs]
+        )
+        batch_embeddings = []
+        for resp_item in response:
+            batch_embeddings.append(resp_item["embeddings"][0]["mean"])
+
+        return torch.tensor(batch_embeddings)
+
     if model_name == "caduceus":
         # Check if the model is already loaded (cached)
         if _caduceus_model is None:
@@ -98,12 +112,12 @@ def embedd_dna_sequence(seqs: list[str], model_name: str = "caduceus") -> torch.
 
     # Remove the embedding for the final [SEP] token
     # The sequence length in the batch is typically inputs['input_ids'].shape[1]
-    embeddings = embeddings[:, :-1, :]
+    embeddings = embeddings[:, :-2, :]
 
     return embeddings
 
 
-def embed_and_save_sequences(df, output_file, chunk_size=200, id_column="dhs_id", debug: bool = False,model="caduceus"):
+def embed_and_save_sequences(df, output_file, chunk_size=200, id_column="dhs_id", debug: bool = False, model="caduceus"):
     """
     Embed DNA sequences and save to HDF5 file with ID-based organization.
 
@@ -226,11 +240,13 @@ if __name__ == "__main__":
     synth_sequences = pd.read_csv(
         "/home/benjaminkroeger/Documents/Master/UBC/Synthetic_data/DNA-Diffusion/data/outputs/original_model_colab/synth_seqs.csv")
 
+    #gt_sequences = gt_sequences.sample(n=4000)
+
     #embed_and_save_sequences(gt_sequences,
-    #                         "/home/benjaminkroeger/Documents/Master/UBC/Synthetic_data/DNA-Diffusion/data/embeddings/nucleotide_transformer/train_val_embeddings.h5",
-    #                         model="nt",
-    #                         chunk_size=200)
-    embed_and_save_sequences(synth_sequences,
-                        "/home/benjaminkroeger/Documents/Master/UBC/Synthetic_data/DNA-Diffusion/data/embeddings/nucleotide_transformer/orig_synth_embeddings.h5",
-                        model="nt",
+     #                        "/home/benjaminkroeger/Documents/Master/UBC/Synthetic_data/DNA-Diffusion/data/embeddings/evo2/train_val_embeddings.h5",
+      #                       model="evo2",
+       #                      chunk_size=200)
+    embed_and_save_sequences(synth_sequences.iloc[2200:],
+                             "/home/benjaminkroeger/Documents/Master/UBC/Synthetic_data/DNA-Diffusion/data/embeddings/evo2/orig_synth_embeddings.h5",
+                             model="evo2",
                              chunk_size=200)
