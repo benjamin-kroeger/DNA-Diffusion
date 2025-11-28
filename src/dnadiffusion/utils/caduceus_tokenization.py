@@ -3,14 +3,37 @@ import torch
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForMaskedLM
 import numpy as np
+import pandas as pd
 
 # --- Configuration ---
-model_name = "kuleshov-group/caduceus-ps_seqlen-131k_d_model-256_n_layer-16"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --- Model Cache (Private Module-Level Variables) ---
 _caduceus_tokenizer = None
 _caduceus_model = None
+
+_nt_model = None
+_nt_tokenizer = None
+
+
+def _load_nucleotide_transformer():
+    global _nt_tokenizer, _nt_model
+
+    print(f"Loading Nucleotide transformer model 'InstaDeepAI/nucleotide-transformer-v2-500m-multi-species' to device: {device}...")
+
+    # 1. Load remote code
+    tokenizer = AutoTokenizer.from_pretrained("InstaDeepAI/nucleotide-transformer-v2-500m-multi-species", trust_remote_code=True)
+    model = AutoModelForMaskedLM.from_pretrained("InstaDeepAI/nucleotide-transformer-v2-500m-multi-species", trust_remote_code=True)
+
+    # Move model to device and set to evaluation mode
+    model.to(device)
+    model.eval()
+
+    # Store in global variables for subsequent calls
+    _nt_tokenizer = tokenizer
+    _nt_model = model
+
+    print("Model loaded and cached.")
 
 
 def _load_caduceus_model():
@@ -20,11 +43,11 @@ def _load_caduceus_model():
     """
     global _caduceus_tokenizer, _caduceus_model
 
-    print(f"Loading Caduceus model '{model_name}' to device: {device}...")
+    print(f"Loading Caduceus model 'kuleshov-group/caduceus-ps_seqlen-131k_d_model-256_n_layer-16' to device: {device}...")
 
     # 1. Load remote code
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModelForMaskedLM.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained("kuleshov-group/caduceus-ps_seqlen-131k_d_model-256_n_layer-16", trust_remote_code=True)
+    model = AutoModelForMaskedLM.from_pretrained("kuleshov-group/caduceus-ps_seqlen-131k_d_model-256_n_layer-16", trust_remote_code=True)
 
     # Move model to device and set to evaluation mode
     model.to(device)
@@ -37,22 +60,31 @@ def _load_caduceus_model():
     print("Model loaded and cached.")
 
 
-def embedd_dna_sequence(seqs: list[str]) -> torch.Tensor:
+def embedd_dna_sequence(seqs: list[str], model_name: str = "caduceus") -> torch.Tensor:
     """
     Embeds DNA sequences using the Caduceus model.
     The model is loaded only on the *first* call.
     """
-    global _caduceus_tokenizer, _caduceus_model
+    global _caduceus_tokenizer, _caduceus_model, _nt_model, _nt_tokenizer
 
-    # Check if the model is already loaded (cached)
-    if _caduceus_model is None:
-        _load_caduceus_model()
+    if model_name == "caduceus":
+        # Check if the model is already loaded (cached)
+        if _caduceus_model is None:
+            _load_caduceus_model()
 
-    # Model and tokenizer are guaranteed to be loaded here
-    tokenizer = _caduceus_tokenizer
-    model = _caduceus_model
+        # Model and tokenizer are guaranteed to be loaded here
+        tokenizer = _caduceus_tokenizer
+        model = _caduceus_model
+    elif model_name == "nt":
+
+        if _nt_model is None:
+            _load_nucleotide_transformer()
+
+        tokenizer = _nt_tokenizer
+        model = _nt_model
 
     # --- Embedding Logic ---
+
     # The tokenizer splits chars, uppercases, and adds [SEP] (at the end)
     inputs = tokenizer(seqs, return_tensors="pt", padding=True, truncation=True)
     inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -70,7 +102,8 @@ def embedd_dna_sequence(seqs: list[str]) -> torch.Tensor:
 
     return embeddings
 
-def embed_and_save_sequences(df, output_file, chunk_size=200, id_column="dhs_id", debug: bool = False):
+
+def embed_and_save_sequences(df, output_file, chunk_size=200, id_column="dhs_id", debug: bool = False,model="caduceus"):
     """
     Embed DNA sequences and save to HDF5 file with ID-based organization.
 
@@ -98,6 +131,7 @@ def embed_and_save_sequences(df, output_file, chunk_size=200, id_column="dhs_id"
             # Embed sequences
             X_chunk = embedd_dna_sequence(
                 seqs=chunk_df["sequence"].to_list(),
+                model_name=model
             ).cpu().numpy()
 
             # Store each embedding with its ID as the key
@@ -113,7 +147,6 @@ def embed_and_save_sequences(df, output_file, chunk_size=200, id_column="dhs_id"
                 # Store metadata as attributes
                 grp.attrs["data_label"] = row["data_label"]
                 grp.attrs["TAG"] = row["TAG"]
-
 
 
 def load_embeddings_from_h5(file_path, n_samples=None):
@@ -178,13 +211,26 @@ def decode_embeddings_to_sequence(embeddings: torch.Tensor) -> list[str]:
 
 
 if __name__ == "__main__":
-    original_seqs = ["ATCGATCG", "GCTAGCTA"]
+    # original_seqs = ["ATCGATCG", "GCTAGCTA"]
+    #
+    # # Encode
+    # embeddings = embedd_dna_sequence(original_seqs)
+    #
+    # # Decode back
+    # reconstructed_seqs = decode_embeddings_to_sequence(embeddings)
+    #
+    # print("Original:", original_seqs)
+    # print("Reconstructed:", reconstructed_seqs)
 
-    # Encode
-    embeddings = embedd_dna_sequence(original_seqs)
+    #gt_sequences = pd.read_csv("/home/benjaminkroeger/Documents/Master/UBC/Synthetic_data/DNA-Diffusion/data/train_val_gt_seqs.tsv", sep="\t")
+    synth_sequences = pd.read_csv(
+        "/home/benjaminkroeger/Documents/Master/UBC/Synthetic_data/DNA-Diffusion/data/outputs/original_model_colab/synth_seqs.csv")
 
-    # Decode back
-    reconstructed_seqs = decode_embeddings_to_sequence(embeddings)
-
-    print("Original:", original_seqs)
-    print("Reconstructed:", reconstructed_seqs)
+    #embed_and_save_sequences(gt_sequences,
+    #                         "/home/benjaminkroeger/Documents/Master/UBC/Synthetic_data/DNA-Diffusion/data/embeddings/nucleotide_transformer/train_val_embeddings.h5",
+    #                         model="nt",
+    #                         chunk_size=200)
+    embed_and_save_sequences(synth_sequences,
+                        "/home/benjaminkroeger/Documents/Master/UBC/Synthetic_data/DNA-Diffusion/data/embeddings/nucleotide_transformer/orig_synth_embeddings.h5",
+                        model="nt",
+                             chunk_size=200)
