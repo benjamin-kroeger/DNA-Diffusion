@@ -112,7 +112,7 @@ def embedd_dna_sequence(seqs: list[str], model_name: str = "caduceus") -> torch.
 
     # Remove the embedding for the final [SEP] token
     # The sequence length in the batch is typically inputs['input_ids'].shape[1]
-    embeddings = embeddings[:, :-2, :]
+    embeddings = embeddings[:, :-1, :]
 
     return embeddings
 
