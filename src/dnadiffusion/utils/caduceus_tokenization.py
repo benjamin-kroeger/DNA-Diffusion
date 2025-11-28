@@ -100,7 +100,7 @@ def embedd_dna_sequence(seqs: list[str], model_name: str = "caduceus") -> torch.
     # --- Embedding Logic ---
 
     # The tokenizer splits chars, uppercases, and adds [SEP] (at the end)
-    inputs = tokenizer(seqs, return_tensors="pt", padding=True, truncation=True)
+    inputs = tokenizer(seqs, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
     with torch.no_grad():
@@ -225,6 +225,8 @@ def decode_embeddings_to_sequence(embeddings: torch.Tensor) -> list[str]:
 
 
 if __name__ == "__main__":
+
+    embedd_dna_sequence(["ATCGATCG", "GCTAGCTA"])
     # original_seqs = ["ATCGATCG", "GCTAGCTA"]
     #
     # # Encode
