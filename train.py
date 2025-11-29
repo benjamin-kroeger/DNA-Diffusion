@@ -89,7 +89,7 @@ def train(
 
 
         val_losses = []
-        for x, y in tqdm(val_dl,deci=f"Validating epoch {epoch}"):
+        for x, y in tqdm(val_dl,desc=f"Validating epoch {epoch}"):
             val_loss = val_step(x, y, model, device, precision)
             val_losses.append(val_loss)
 
