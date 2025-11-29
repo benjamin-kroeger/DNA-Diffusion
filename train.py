@@ -85,7 +85,6 @@ def train(
                 wandb.log({"loss": np.average(recent_losses), "epoch": epoch}, step=global_step)
                 recent_losses.clear()
 
-            break
 
 
         val_losses = []

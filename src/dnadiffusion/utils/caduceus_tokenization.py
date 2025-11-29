@@ -226,7 +226,8 @@ def decode_embeddings_to_sequence(embeddings: torch.Tensor) -> list[str]:
 
 if __name__ == "__main__":
 
-    embedd_dna_sequence(["ATCGATCG", "GCTAGCTA"])
+    test_embedds = embedd_dna_sequence(["ATCGATCG", "GCTAGCTA"])
+    print(decode_embeddings_to_sequence(test_embedds))
     # original_seqs = ["ATCGATCG", "GCTAGCTA"]
     #
     # # Encode
@@ -239,8 +240,8 @@ if __name__ == "__main__":
     # print("Reconstructed:", reconstructed_seqs)
 
     #gt_sequences = pd.read_csv("/home/benjaminkroeger/Documents/Master/UBC/Synthetic_data/DNA-Diffusion/data/train_val_gt_seqs.tsv", sep="\t")
-    synth_sequences = pd.read_csv(
-        "/home/benjaminkroeger/Documents/Master/UBC/Synthetic_data/DNA-Diffusion/data/outputs/original_model_colab/synth_seqs.csv")
+    #synth_sequences = pd.read_csv(
+    #    "/home/benjaminkroeger/Documents/Master/UBC/Synthetic_data/DNA-Diffusion/data/outputs/original_model_colab/synth_seqs.csv")
 
     #gt_sequences = gt_sequences.sample(n=4000)
 
@@ -248,7 +249,8 @@ if __name__ == "__main__":
      #                        "/home/benjaminkroeger/Documents/Master/UBC/Synthetic_data/DNA-Diffusion/data/embeddings/evo2/train_val_embeddings.h5",
       #                       model="evo2",
        #                      chunk_size=200)
-    embed_and_save_sequences(synth_sequences.iloc[2200:],
-                             "/home/benjaminkroeger/Documents/Master/UBC/Synthetic_data/DNA-Diffusion/data/embeddings/evo2/orig_synth_embeddings.h5",
-                             model="evo2",
-                             chunk_size=200)
+    #embed_and_save_sequences(synth_sequences.iloc[2200:],
+    #                         "/home/benjaminkroeger/Documents/Master/UBC/Synthetic_data/DNA-Diffusion/data/embeddings/evo2/orig_synth_embeddings.h5",
+    #                         model="evo2",
+    #                         chunk_size=200)
+#
