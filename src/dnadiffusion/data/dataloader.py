@@ -171,6 +171,7 @@ def load_data(
     req_embedding_save_path = os.path.join(embedding_save_path, foundation_model)
     train_embed_file = os.path.join(req_embedding_save_path, f"train_embeddings{'_debug' if debug else ""}.h5")
     val_embed_file = os.path.join(req_embedding_save_path, f"val_embeddings{'_debug' if debug else ""}.h5")
+    test_embed_file = os.path.join(req_embedding_save_path, f"test_embeddings{'_debug' if debug else ""}.h5")
     if not load_embeddings or not os.path.exists(train_embed_file):
         embed_and_save_sequences(
             df=df,
@@ -187,7 +188,7 @@ def load_data(
         embed_and_save_sequences(
             df=test_df,
             chunk_size=200,
-            output_file=val_embed_file,
+            output_file=test_embed_file,
             debug=debug
         )
 
