@@ -136,7 +136,7 @@ class EmbeddingCacheH5:
                 dtype='float32',
                 compression='gzip',
                 compression_opts=4,
-                chunks=(min(1000, len(embeddings)), embeddings.shape[1], embeddings.shape[2]),
+                chunks=(min(100, len(embeddings)), embeddings.shape[1], embeddings.shape[2]),
             )
             f.create_dataset(
                 'targets',
@@ -144,7 +144,7 @@ class EmbeddingCacheH5:
                 dtype='int8',  # Small integers, save space
                 compression='gzip',
                 compression_opts=4,
-                chunks=(min(1000, len(targets)), targets.shape[1]),
+                chunks=(min(100, len(targets)), targets.shape[1]),
             )
 
         file_size = self.cache_path.stat().st_size / (1024 ** 2)
@@ -388,7 +388,7 @@ def main(
     else:
         print(f"Generating embeddings for {len(sequences)} sequences...")
         embeddings, targets = generate_embeddings(
-            sequences, caduceus_model, tokenizer, batch_size=20, device=device
+            sequences, caduceus_model, tokenizer, batch_size=10, device=device
         )
         cache.save(embeddings, targets)
 
@@ -514,8 +514,8 @@ if __name__ == "__main__":
 
     train_sequences, test_seqs = sample_sequences(
         fasta_path="/home/benjaminkroeger/Downloads/GRCh38.p14.genome.fa",
-        window_size=2000,
-        seqs_per_chr=20
+        window_size=3000,
+        seqs_per_chr=60
     )
 
 
@@ -526,7 +526,7 @@ if __name__ == "__main__":
         tokenizer=tokenizer,
         cache_path="./embeddings_cache.h5",
         batch_size=20,
-        epochs=20,
+        epochs=10,
         lr=1e-3,
         device=device,
         save_path="caduceus_decoder.pt",
@@ -538,8 +538,8 @@ if __name__ == "__main__":
     all_orig = []
     all_recon = []
 
-    for i in range(0, len(test_seqs), 20):
-        batch = test_seqs[i:i + 20]
+    for i in range(0, len(test_seqs), 10):
+        batch = test_seqs[i:i + 10]
         inputs = tokenizer(batch, return_tensors="pt", padding=True).to(device)
 
         with torch.no_grad():
