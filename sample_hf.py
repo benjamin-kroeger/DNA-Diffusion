@@ -41,10 +41,13 @@ def sample(
 @hydra.main(config_path="configs", config_name="sample_hf", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
+
+    data, train_mu, train_sd = hydra.utils.instantiate(cfg.data)
+
     pretrained_unet = hydra.utils.instantiate(cfg.model)
-    unet = pretrained_unet.model
-    diffusion = hydra.utils.instantiate(cfg.diffusion, model=unet)
-    data = hydra.utils.instantiate(cfg.data)
+
+    diffusion = hydra.utils.instantiate(cfg.diffusion, model=pretrained_unet, mu=train_mu, sd=train_sd)
+
 
     sample(
         data=data,

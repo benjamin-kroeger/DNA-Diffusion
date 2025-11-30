@@ -22,7 +22,7 @@ def create_sample(
     final_sequences = []
     num_batches = number_of_samples // sample_bs
 
-    with h5py.File("sampled_embedd.h5", "w") as h5f:
+    with h5py.File(f"sampled_embedd_{cell_type}.h5", "w") as h5f:
         for n_a in tqdm(range(num_batches)):
             sampled = torch.from_numpy(np.array([cell_type] * sample_bs))
             classes = sampled.float().to(model.device)
@@ -39,7 +39,7 @@ def create_sample(
 
                 grp = h5f.create_group(f"seq_{n_a}")
                 grp.attrs["cell_type"] = conditional_numeric_to_tag[cell_type]
-                grp.create_dataset("embedding", data=sampled_images, dtype="float32")
+                grp.create_dataset("embedding", data=sampled_images[-1], dtype="float32")
 
 
         # if save_timesteps:

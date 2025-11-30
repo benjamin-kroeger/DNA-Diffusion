@@ -1,5 +1,5 @@
 defaults:
-    - model: unet_pretrained
+    - model: unet_from_checkpoint
     - data: sampling
     - diffusion: default
     - sampling: default_hf

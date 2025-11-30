@@ -4,4 +4,4 @@ channels: 1
 dim_mults: [1,2,4]
 resnet_block_groups: 4
 embedding_dim: 512
-checkpoint_path: /home/benjaminkroeger/Documents/Master/UBC/Synthetic_data/DNA-Diffusion/checkpoints/model_epoch1_step78508_valloss_0.125004.pt
+checkpoint_path: /home/benjaminkroeger/Documents/Master/UBC/Synthetic_data/DNA-Diffusion/checkpoints/final_run/model_epoch2_step117762_valloss_0.096575.pt
