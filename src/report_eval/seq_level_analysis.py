@@ -7,6 +7,10 @@ Computes sequence-level metrics comparing ground truth vs synthetic sequences:
 - Sequence diversity (mean pairwise Hamming distance)
 - K-mer frequency similarities (3, 5, 7, 9-mers)
 - GC content similarity
+- Discriminator accuracy (can a classifier distinguish real from synthetic?)
+- Fréchet distance (like FID for images, but for k-mer distributions)
+- Maximum Mean Discrepancy (MMD) - kernel-based distributional distance
+- Precision/Recall/Coverage for generative models
 
 Supports:
 - Multiple synthetic datasets (for comparing different models)
@@ -22,6 +26,12 @@ from collections import Counter, defaultdict
 from typing import List, Dict, Tuple, Optional, Union
 from scipy.stats import entropy, ttest_ind, mannwhitneyu
 from scipy.spatial.distance import jensenshannon
+from scipy.linalg import sqrtm
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.feature_extraction import DictVectorizer
+from sklearn.preprocessing import StandardScaler
 from dataclasses import dataclass, field
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -452,6 +462,598 @@ class DNASequenceMetrics:
             'query_distribution': query_gc.tolist(),
         }
 
+    # ==================== Distributional Distance Metrics ====================
+
+    def _get_kmer_feature_vectors(self,
+                                  sequences: List[str],
+                                  k: int = 4) -> np.ndarray:
+        """
+        Convert sequences to k-mer frequency vectors for distributional comparisons.
+
+        Args:
+            sequences: List of DNA sequences
+            k: k-mer size (default 4 for 256 features)
+
+        Returns:
+            (n_sequences, 4^k) array of k-mer frequencies
+        """
+        # Generate all possible k-mers
+        from itertools import product
+        all_kmers = [''.join(p) for p in product('ACGT', repeat=k)]
+        kmer_to_idx = {km: i for i, km in enumerate(all_kmers)}
+        n_kmers = len(all_kmers)
+
+        # Build feature matrix
+        X = np.zeros((len(sequences), n_kmers), dtype=np.float32)
+
+        for i, seq in enumerate(sequences):
+            seq = seq.upper()
+            kmer_counts = Counter()
+            for j in range(len(seq) - k + 1):
+                kmer = seq[j:j + k]
+                if kmer in kmer_to_idx:  # Skip k-mers with N
+                    kmer_counts[kmer] += 1
+
+            total = sum(kmer_counts.values())
+            if total > 0:
+                for kmer, count in kmer_counts.items():
+                    X[i, kmer_to_idx[kmer]] = count / total
+
+        return X
+
+    def compute_discriminator_metrics(self,
+                                      reference_seqs: List[str],
+                                      query_seqs: List[str],
+                                      k: int = 4,
+                                      n_samples: int = 5000,
+                                      show_progress: bool = True) -> Dict:
+        """
+        Train a classifier to distinguish real from synthetic sequences.
+
+        If accuracy >> 50%, the synthetic data is distinguishable from real.
+        This is a direct measure of generation quality.
+
+        Uses BALANCED sampling to ensure fair comparison regardless of
+        dataset sizes.
+
+        Args:
+            reference_seqs: Ground truth sequences (label=0)
+            query_seqs: Synthetic sequences (label=1)
+            k: k-mer size for features
+            n_samples: Max samples per class (for speed)
+
+        Returns:
+            Dictionary with classifier accuracies and feature importances
+        """
+        if show_progress:
+            print("  Building k-mer feature vectors...")
+
+        # BALANCED SAMPLING: Use equal numbers from each class
+        # Take minimum of: n_samples, len(reference), len(query)
+        n_per_class = min(n_samples, len(reference_seqs), len(query_seqs))
+
+        if show_progress:
+            print(f"  Using balanced sampling: {n_per_class} sequences per class")
+
+        # Sample from reference
+        if len(reference_seqs) > n_per_class:
+            ref_idx = np.random.choice(len(reference_seqs), n_per_class, replace=False)
+            ref_sample = [reference_seqs[i] for i in ref_idx]
+        else:
+            ref_sample = reference_seqs
+
+        # Sample from query
+        if len(query_seqs) > n_per_class:
+            query_idx = np.random.choice(len(query_seqs), n_per_class, replace=False)
+            query_sample = [query_seqs[i] for i in query_idx]
+        else:
+            query_sample = query_seqs
+
+        # Get feature vectors
+        X_ref = self._get_kmer_feature_vectors(ref_sample, k)
+        X_query = self._get_kmer_feature_vectors(query_sample, k)
+
+        # Combine and create labels (balanced: 50% each class)
+        X = np.vstack([X_ref, X_query])
+        y = np.array([0] * len(X_ref) + [1] * len(X_query))
+
+        # Shuffle
+        shuffle_idx = np.random.permutation(len(y))
+        X = X[shuffle_idx]
+        y = y[shuffle_idx]
+
+        # Standardize features
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        if show_progress:
+            print("  Training classifiers with cross-validation (balanced classes)...")
+
+        # Train Random Forest with class balancing
+        rf = RandomForestClassifier(n_estimators=100, max_depth=10,
+                                    class_weight='balanced', random_state=42, n_jobs=-1)
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+        # Use balanced_accuracy_score for proper evaluation
+        rf_scores = cross_val_score(rf, X_scaled, y, cv=cv, scoring='balanced_accuracy')
+
+        # Also get ROC-AUC which is threshold-independent
+        rf_auc_scores = cross_val_score(rf, X_scaled, y, cv=cv, scoring='roc_auc')
+
+        # Train Logistic Regression with class balancing
+        lr = LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42)
+        lr_scores = cross_val_score(lr, X_scaled, y, cv=cv, scoring='balanced_accuracy')
+        lr_auc_scores = cross_val_score(lr, X_scaled, y, cv=cv, scoring='roc_auc')
+
+        # Train final RF to get feature importances
+        rf.fit(X_scaled, y)
+
+        # Get top discriminating k-mers
+        from itertools import product
+        all_kmers = [''.join(p) for p in product('ACGT', repeat=k)]
+        importance_idx = np.argsort(rf.feature_importances_)[::-1][:20]
+        top_kmers = [(all_kmers[i], float(rf.feature_importances_[i])) for i in importance_idx]
+
+        # Interpretation based on balanced accuracy
+        rf_acc = float(np.mean(rf_scores))
+        rf_auc = float(np.mean(rf_auc_scores))
+
+        interpretation = "indistinguishable (good!)" if rf_acc < 0.55 else \
+            "slightly distinguishable" if rf_acc < 0.60 else \
+                "moderately distinguishable" if rf_acc < 0.70 else \
+                    "highly distinguishable" if rf_acc < 0.80 else \
+                        "very easily distinguishable (poor generation)"
+
+        return {
+            'balanced_accuracy': rf_acc,
+            'balanced_accuracy_std': float(np.std(rf_scores)),
+            'roc_auc': rf_auc,
+            'roc_auc_std': float(np.std(rf_auc_scores)),
+            'logistic_regression_balanced_acc': float(np.mean(lr_scores)),
+            'logistic_regression_auc': float(np.mean(lr_auc_scores)),
+            'baseline_accuracy': 0.5,  # Random chance with balanced classes
+            'interpretation': interpretation,
+            'top_discriminating_kmers': top_kmers,
+            'kmer_size': k,
+            'n_per_class': n_per_class,
+            'total_samples': len(X),
+        }
+
+    def compute_frechet_distance(self,
+                                 reference_seqs: List[str],
+                                 query_seqs: List[str],
+                                 k: int = 4,
+                                 show_progress: bool = True) -> Dict:
+        """
+        Compute Fréchet Distance on k-mer distributions.
+
+        Analogous to FID (Fréchet Inception Distance) for images.
+        Lower values indicate more similar distributions.
+
+        FD = ||μ_r - μ_q||² + Tr(Σ_r + Σ_q - 2(Σ_r Σ_q)^(1/2))
+
+        Args:
+            reference_seqs: Ground truth sequences
+            query_seqs: Synthetic sequences
+            k: k-mer size for features
+
+        Returns:
+            Dictionary with Fréchet distance and component metrics
+        """
+        if show_progress:
+            print("  Computing k-mer feature vectors...")
+
+        X_ref = self._get_kmer_feature_vectors(reference_seqs, k)
+        X_query = self._get_kmer_feature_vectors(query_seqs, k)
+
+        if show_progress:
+            print("  Computing distribution statistics...")
+
+        # Compute means
+        mu_ref = np.mean(X_ref, axis=0)
+        mu_query = np.mean(X_query, axis=0)
+
+        # Compute covariances (with regularization for numerical stability)
+        sigma_ref = np.cov(X_ref, rowvar=False) + np.eye(X_ref.shape[1]) * 1e-6
+        sigma_query = np.cov(X_query, rowvar=False) + np.eye(X_query.shape[1]) * 1e-6
+
+        if show_progress:
+            print("  Computing Fréchet distance...")
+
+        # Mean difference term
+        mean_diff = np.sum((mu_ref - mu_query) ** 2)
+
+        # Covariance term
+        try:
+            # Compute sqrt of product of covariances
+            covmean = sqrtm(sigma_ref @ sigma_query)
+
+            # Handle numerical issues (imaginary parts from sqrtm)
+            if np.iscomplexobj(covmean):
+                covmean = covmean.real
+
+            cov_term = np.trace(sigma_ref + sigma_query - 2 * covmean)
+        except Exception as e:
+            # Fallback: just use trace difference
+            print(f"  Warning: sqrtm failed ({e}), using simplified metric")
+            cov_term = np.trace(sigma_ref) + np.trace(sigma_query)
+
+        frechet_distance = float(mean_diff + cov_term)
+
+        return {
+            'frechet_distance': frechet_distance,
+            'mean_difference_term': float(mean_diff),
+            'covariance_term': float(cov_term),
+            'kmer_size': k,
+            'feature_dim': X_ref.shape[1],
+        }
+
+    def compute_mmd(self,
+                    reference_seqs: List[str],
+                    query_seqs: List[str],
+                    k: int = 4,
+                    n_samples: int = 2000,
+                    show_progress: bool = True) -> Dict:
+        """
+        Compute Maximum Mean Discrepancy (MMD) between distributions.
+
+        MMD is a kernel-based distance between distributions.
+        MMD = 0 indicates identical distributions.
+
+        Args:
+            reference_seqs: Ground truth sequences
+            query_seqs: Synthetic sequences
+            k: k-mer size for features
+            n_samples: Max samples (MMD is O(n²))
+
+        Returns:
+            Dictionary with MMD values for different kernels
+        """
+        if show_progress:
+            print("  Computing k-mer feature vectors...")
+
+        # Sample for computational efficiency
+        if len(reference_seqs) > n_samples:
+            ref_idx = np.random.choice(len(reference_seqs), n_samples, replace=False)
+            ref_sample = [reference_seqs[i] for i in ref_idx]
+        else:
+            ref_sample = reference_seqs
+
+        if len(query_seqs) > n_samples:
+            query_idx = np.random.choice(len(query_seqs), n_samples, replace=False)
+            query_sample = [query_seqs[i] for i in query_idx]
+        else:
+            query_sample = query_seqs
+
+        X_ref = self._get_kmer_feature_vectors(ref_sample, k)
+        X_query = self._get_kmer_feature_vectors(query_sample, k)
+
+        if show_progress:
+            print("  Computing MMD with RBF kernel...")
+
+        def rbf_kernel(X, Y, gamma):
+            """Compute RBF kernel between X and Y."""
+            # ||x - y||² = ||x||² + ||y||² - 2<x,y>
+            X_sqnorm = np.sum(X ** 2, axis=1)
+            Y_sqnorm = np.sum(Y ** 2, axis=1)
+
+            # Pairwise squared distances
+            sq_dist = X_sqnorm[:, np.newaxis] + Y_sqnorm[np.newaxis, :] - 2 * X @ Y.T
+
+            return np.exp(-gamma * sq_dist)
+
+        def compute_mmd_rbf(X, Y, gamma):
+            """Compute MMD² with RBF kernel."""
+            K_XX = rbf_kernel(X, X, gamma)
+            K_YY = rbf_kernel(Y, Y, gamma)
+            K_XY = rbf_kernel(X, Y, gamma)
+
+            n = len(X)
+            m = len(Y)
+
+            # MMD² = E[k(x,x')] + E[k(y,y')] - 2E[k(x,y)]
+            # Use unbiased estimator (exclude diagonal for K_XX and K_YY)
+            mmd_sq = (np.sum(K_XX) - np.trace(K_XX)) / (n * (n - 1)) + \
+                     (np.sum(K_YY) - np.trace(K_YY)) / (m * (m - 1)) - \
+                     2 * np.mean(K_XY)
+
+            return max(0, mmd_sq)  # Ensure non-negative
+
+        # Compute median heuristic for gamma
+        from scipy.spatial.distance import pdist
+        all_data = np.vstack([X_ref[:500], X_query[:500]])  # Subsample for median
+        pairwise_dists = pdist(all_data, 'sqeuclidean')
+        median_dist = np.median(pairwise_dists)
+        gamma_median = 1.0 / (median_dist + 1e-10)
+
+        # Compute MMD with different gamma values
+        mmd_results = {}
+        for gamma_mult, name in [(0.1, 'small'), (1.0, 'median'), (10.0, 'large')]:
+            gamma = gamma_median * gamma_mult
+            mmd_sq = compute_mmd_rbf(X_ref, X_query, gamma)
+            mmd_results[f'mmd_{name}_gamma'] = float(np.sqrt(mmd_sq))
+
+        # Linear kernel MMD (simpler, faster)
+        if show_progress:
+            print("  Computing MMD with linear kernel...")
+
+        mean_ref = np.mean(X_ref, axis=0)
+        mean_query = np.mean(X_query, axis=0)
+        mmd_linear = float(np.sqrt(np.sum((mean_ref - mean_query) ** 2)))
+
+        return {
+            'mmd_linear': mmd_linear,
+            'mmd_rbf_small_gamma': mmd_results['mmd_small_gamma'],
+            'mmd_rbf_median_gamma': mmd_results['mmd_median_gamma'],
+            'mmd_rbf_large_gamma': mmd_results['mmd_large_gamma'],
+            'kmer_size': k,
+            'n_reference_samples': len(ref_sample),
+            'n_query_samples': len(query_sample),
+        }
+
+    def compute_precision_recall_density_coverage(self,
+                                                  reference_seqs: List[str],
+                                                  query_seqs: List[str],
+                                                  k: int = 4,
+                                                  n_neighbors: int = 5,
+                                                  n_samples: int = 5000,
+                                                  show_progress: bool = True) -> Dict:
+        """
+        Compute Precision, Recall, Density, and Coverage metrics.
+
+        These metrics measure:
+        - Precision: fraction of synthetic samples that are realistic (near real data)
+        - Recall: fraction of real data modes covered by synthetic
+        - Density: how many real samples are near each synthetic sample
+        - Coverage: fraction of real samples with a synthetic neighbor
+
+        Based on "Improved Precision and Recall Metric for Assessing Generative Models"
+
+        Args:
+            reference_seqs: Ground truth sequences
+            query_seqs: Synthetic sequences
+            k: k-mer size for features
+            n_neighbors: Number of neighbors for manifold estimation
+            n_samples: Max samples per dataset
+
+        Returns:
+            Dictionary with precision, recall, density, coverage
+        """
+        from sklearn.neighbors import NearestNeighbors
+
+        if show_progress:
+            print("  Computing k-mer feature vectors...")
+
+        # Sample if needed
+        if len(reference_seqs) > n_samples:
+            ref_idx = np.random.choice(len(reference_seqs), n_samples, replace=False)
+            ref_sample = [reference_seqs[i] for i in ref_idx]
+        else:
+            ref_sample = reference_seqs
+
+        if len(query_seqs) > n_samples:
+            query_idx = np.random.choice(len(query_seqs), n_samples, replace=False)
+            query_sample = [query_seqs[i] for i in query_idx]
+        else:
+            query_sample = query_seqs
+
+        X_ref = self._get_kmer_feature_vectors(ref_sample, k)
+        X_query = self._get_kmer_feature_vectors(query_sample, k)
+
+        if show_progress:
+            print("  Computing nearest neighbor manifolds...")
+
+        # Fit nearest neighbors on reference
+        nn_ref = NearestNeighbors(n_neighbors=n_neighbors + 1, algorithm='auto')
+        nn_ref.fit(X_ref)
+
+        # Get distances to k-th nearest neighbor for each reference point (manifold radius)
+        ref_distances, _ = nn_ref.kneighbors(X_ref)
+        ref_radii = ref_distances[:, -1]  # k-th neighbor distance
+
+        # Fit nearest neighbors on query
+        nn_query = NearestNeighbors(n_neighbors=n_neighbors + 1, algorithm='auto')
+        nn_query.fit(X_query)
+
+        query_distances, _ = nn_query.kneighbors(X_query)
+        query_radii = query_distances[:, -1]
+
+        if show_progress:
+            print("  Computing precision and recall...")
+
+        # Precision: fraction of query points within reference manifold
+        query_to_ref_dist, query_to_ref_idx = nn_ref.kneighbors(X_query, n_neighbors=1)
+        query_to_ref_dist = query_to_ref_dist.flatten()
+        query_to_ref_idx = query_to_ref_idx.flatten()
+
+        # Query point is "realistic" if within radius of its nearest reference
+        precision_mask = query_to_ref_dist <= ref_radii[query_to_ref_idx]
+        precision = float(np.mean(precision_mask))
+
+        # Recall: fraction of reference points with query neighbor within their radius
+        ref_to_query_dist, _ = nn_query.kneighbors(X_ref, n_neighbors=1)
+        ref_to_query_dist = ref_to_query_dist.flatten()
+
+        recall_mask = ref_to_query_dist <= ref_radii
+        recall = float(np.mean(recall_mask))
+
+        # Density: average number of reference points near each query point
+        # (measures how well synthetic concentrates in high-density regions)
+        density_counts = np.sum(query_to_ref_dist[:, np.newaxis] <= ref_radii[np.newaxis, :], axis=1)
+        density = float(np.mean(density_counts) / n_neighbors)
+
+        # Coverage: fraction of reference points that have at least one query neighbor
+        coverage = float(np.mean(recall_mask))  # Same as recall in this formulation
+
+        # F1 score
+        f1 = 2 * precision * recall / (precision + recall + 1e-10)
+
+        return {
+            'precision': precision,
+            'recall': recall,
+            'f1_score': float(f1),
+            'density': density,
+            'coverage': coverage,
+            'n_neighbors': n_neighbors,
+            'kmer_size': k,
+            'n_reference_samples': len(ref_sample),
+            'n_query_samples': len(query_sample),
+        }
+
+    # ==================== Cell-Type Conditional Fidelity ====================
+
+    def compute_celltype_fidelity(self,
+                                  reference_seqs: List[str],
+                                  reference_celltypes: List[str],
+                                  query_seqs: List[str],
+                                  query_celltypes: List[str],
+                                  k: int = 4,
+                                  test_size: float = 0.2,
+                                  show_progress: bool = True) -> Dict:
+        """
+        Measure how well synthetic sequences preserve cell-type specificity.
+
+        Approach:
+        1. Train a classifier on GT sequences to predict cell type
+        2. Test on held-out GT → baseline accuracy
+        3. Test on synthetic → if accuracy drops, synthetic loses cell-type identity
+
+        The GAP between GT and synthetic accuracy measures conditional generation fidelity.
+
+        Args:
+            reference_seqs: Ground truth sequences
+            reference_celltypes: Cell type labels for GT (e.g., from TAG column)
+            query_seqs: Synthetic sequences
+            query_celltypes: Conditioned cell type labels for synthetic
+            k: k-mer size for features
+            test_size: Fraction of GT to hold out for testing
+
+        Returns:
+            Dictionary with accuracies and fidelity gap
+        """
+        from sklearn.model_selection import train_test_split
+        from sklearn.preprocessing import LabelEncoder
+
+        if show_progress:
+            print("  Building k-mer feature vectors for cell-type classification...")
+
+        # Encode cell types
+        le = LabelEncoder()
+        all_celltypes = list(set(reference_celltypes) | set(query_celltypes))
+        le.fit(all_celltypes)
+
+        ref_labels = le.transform(reference_celltypes)
+        query_labels = le.transform(query_celltypes)
+
+        n_classes = len(le.classes_)
+
+        if show_progress:
+            print(f"  Found {n_classes} cell types: {list(le.classes_)}")
+
+        # Get features
+        X_ref = self._get_kmer_feature_vectors(reference_seqs, k)
+        X_query = self._get_kmer_feature_vectors(query_seqs, k)
+
+        # Split GT into train/test
+        X_train, X_test_gt, y_train, y_test_gt = train_test_split(
+            X_ref, ref_labels, test_size=test_size, stratify=ref_labels, random_state=42
+        )
+
+        if show_progress:
+            print(f"  Training set: {len(X_train)} sequences")
+            print(f"  GT test set: {len(X_test_gt)} sequences")
+            print(f"  Synthetic test set: {len(X_query)} sequences")
+
+        # Standardize
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_gt_scaled = scaler.transform(X_test_gt)
+        X_query_scaled = scaler.transform(X_query)
+
+        if show_progress:
+            print("  Training Random Forest classifier on GT...")
+
+        # Train classifier on GT
+        rf = RandomForestClassifier(n_estimators=100, max_depth=15,
+                                    class_weight='balanced', random_state=42, n_jobs=-1)
+        rf.fit(X_train_scaled, y_train)
+
+        # Test on held-out GT
+        gt_accuracy = rf.score(X_test_gt_scaled, y_test_gt)
+        gt_predictions = rf.predict(X_test_gt_scaled)
+
+        # Test on synthetic
+        synth_accuracy = rf.score(X_query_scaled, query_labels)
+        synth_predictions = rf.predict(X_query_scaled)
+
+        # Compute per-class accuracies
+        gt_per_class = {}
+        synth_per_class = {}
+
+        for i, celltype in enumerate(le.classes_):
+            # GT
+            gt_mask = y_test_gt == i
+            if gt_mask.sum() > 0:
+                gt_per_class[celltype] = float((gt_predictions[gt_mask] == i).mean())
+
+            # Synthetic
+            synth_mask = query_labels == i
+            if synth_mask.sum() > 0:
+                synth_per_class[celltype] = float((synth_predictions[synth_mask] == i).mean())
+
+        # Fidelity gap
+        fidelity_gap = gt_accuracy - synth_accuracy
+
+        # Baseline (random) accuracy
+        baseline = 1.0 / n_classes
+
+        # Interpretation
+        if fidelity_gap < 0.05:
+            interpretation = "excellent - synthetic preserves cell-type specificity"
+        elif fidelity_gap < 0.10:
+            interpretation = "good - minor loss of cell-type specificity"
+        elif fidelity_gap < 0.20:
+            interpretation = "moderate - noticeable loss of cell-type specificity"
+        else:
+            interpretation = "poor - synthetic loses cell-type identity"
+
+        # Also train logistic regression for comparison
+        lr = LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42)
+        lr.fit(X_train_scaled, y_train)
+        gt_accuracy_lr = lr.score(X_test_gt_scaled, y_test_gt)
+        synth_accuracy_lr = lr.score(X_query_scaled, query_labels)
+
+        # Confusion analysis: what cell types get confused?
+        from collections import Counter
+        synth_confusion = Counter()
+        for true_label, pred_label in zip(query_labels, synth_predictions):
+            if true_label != pred_label:
+                true_name = le.classes_[true_label]
+                pred_name = le.classes_[pred_label]
+                synth_confusion[f"{true_name}→{pred_name}"] += 1
+
+        top_confusions = synth_confusion.most_common(5)
+
+        return {
+            'gt_accuracy': float(gt_accuracy),
+            'synthetic_accuracy': float(synth_accuracy),
+            'fidelity_gap': float(fidelity_gap),
+            'baseline_accuracy': float(baseline),
+            'interpretation': interpretation,
+            'gt_accuracy_lr': float(gt_accuracy_lr),
+            'synthetic_accuracy_lr': float(synth_accuracy_lr),
+            'fidelity_gap_lr': float(gt_accuracy_lr - synth_accuracy_lr),
+            'n_classes': n_classes,
+            'cell_types': list(le.classes_),
+            'gt_per_class_accuracy': gt_per_class,
+            'synthetic_per_class_accuracy': synth_per_class,
+            'top_confusions': top_confusions,
+            'n_train': len(X_train),
+            'n_test_gt': len(X_test_gt),
+            'n_test_synthetic': len(X_query),
+            'kmer_size': k,
+        }
+
     # ==================== Full Evaluation ====================
 
     def evaluate(self,
@@ -459,7 +1061,10 @@ class DNASequenceMetrics:
                  query_seqs: List[str],
                  query_name: str = "synthetic",
                  cluster_assignments: Optional[np.ndarray] = None,
-                 show_progress: bool = True) -> Dict:
+                 reference_celltypes: Optional[List[str]] = None,
+                 query_celltypes: Optional[List[str]] = None,
+                 show_progress: bool = True,
+                 compute_distributional: bool = True) -> Dict:
         """
         Run full evaluation suite.
 
@@ -468,7 +1073,11 @@ class DNASequenceMetrics:
             query_seqs: Synthetic/query sequences to evaluate
             query_name: Name identifier for the query dataset
             cluster_assignments: Optional cluster labels for query_seqs
+            reference_celltypes: Optional cell type labels for reference (TAG column)
+            query_celltypes: Optional cell type labels for query (TAG column)
             show_progress: Show progress bars
+            compute_distributional: Whether to compute distributional metrics
+                                   (discriminator, Fréchet, MMD) - slower but informative
 
         Returns:
             Dictionary with all metrics
@@ -486,17 +1095,48 @@ class DNASequenceMetrics:
         }
 
         # Global metrics
-        print("\n[1/4] Computing novelty metrics...")
+        print("\n[1/9] Computing novelty metrics...")
         results['novelty'] = self.compute_novelty(reference_seqs, query_seqs, show_progress)
 
-        print("\n[2/4] Computing diversity metrics...")
+        print("\n[2/9] Computing diversity metrics...")
         results['diversity'] = self.compute_diversity(query_seqs, show_progress)
 
-        print("\n[3/4] Computing k-mer metrics...")
+        print("\n[3/9] Computing k-mer metrics...")
         results['kmer'] = self.compute_kmer_metrics(reference_seqs, query_seqs)
 
-        print("\n[4/4] Computing GC content metrics...")
+        print("\n[4/9] Computing GC content metrics...")
         results['gc_content'] = self.compute_gc_metrics(reference_seqs, query_seqs)
+
+        # Distributional metrics (new)
+        if compute_distributional:
+            print("\n[5/9] Training discriminator (can synthetic be distinguished from real?)...")
+            results['discriminator'] = self.compute_discriminator_metrics(
+                reference_seqs, query_seqs, k=4, show_progress=show_progress
+            )
+
+            print("\n[6/9] Computing Fréchet distance (like FID for DNA)...")
+            results['frechet'] = self.compute_frechet_distance(
+                reference_seqs, query_seqs, k=4, show_progress=show_progress
+            )
+
+            print("\n[7/9] Computing MMD (kernel-based distributional distance)...")
+            results['mmd'] = self.compute_mmd(
+                reference_seqs, query_seqs, k=4, show_progress=show_progress
+            )
+
+            print("\n[8/9] Computing precision/recall/coverage...")
+            results['precision_recall'] = self.compute_precision_recall_density_coverage(
+                reference_seqs, query_seqs, k=4, show_progress=show_progress
+            )
+
+        # Cell-type conditional fidelity (if cell types provided)
+        if reference_celltypes is not None and query_celltypes is not None:
+            print("\n[9/9] Computing cell-type conditional fidelity...")
+            results['celltype_fidelity'] = self.compute_celltype_fidelity(
+                reference_seqs, reference_celltypes,
+                query_seqs, query_celltypes,
+                k=4, show_progress=show_progress
+            )
 
         # Per-cluster analysis if provided
         if cluster_assignments is not None:
@@ -864,28 +1504,58 @@ class MetricsVisualizer:
         return str(filepath)
 
 
-def load_sequences(filepath: str) -> List[str]:
-    """Load sequences from various file formats."""
+def load_sequences(filepath: str, return_celltypes: bool = False) -> Union[List[str], Tuple[List[str], List[str]]]:
+    """
+    Load sequences from various file formats.
+
+    Args:
+        filepath: Path to sequence file
+        return_celltypes: If True and TAG column exists, return (sequences, celltypes)
+
+    Returns:
+        List of sequences, or tuple of (sequences, celltypes) if return_celltypes=True
+    """
     filepath = Path(filepath)
+    celltypes = None
 
     if filepath.suffix == '.csv':
         df = pd.read_csv(filepath)
         # Try common column names
+        sequences = None
         for col in ['sequence', 'seq', 'Sequence', 'SEQ']:
             if col in df.columns:
-                return df[col].tolist()
-        return df.iloc[:, 0].tolist()
+                sequences = df[col].tolist()
+                break
+        if sequences is None:
+            sequences = df.iloc[:, 0].tolist()
+
+        # Check for cell type column
+        if return_celltypes:
+            for col in ['TAG', 'tag', 'celltype', 'cell_type', 'CellType']:
+                if col in df.columns:
+                    celltypes = df[col].tolist()
+                    break
 
     elif filepath.suffix == '.tsv':
         df = pd.read_csv(filepath, sep='\t')
+        sequences = None
         for col in ['sequence', 'seq', 'Sequence', 'SEQ']:
             if col in df.columns:
-                return df[col].tolist()
-        return df.iloc[:, 0].tolist()
+                sequences = df[col].tolist()
+                break
+        if sequences is None:
+            sequences = df.iloc[:, 0].tolist()
+
+        # Check for cell type column
+        if return_celltypes:
+            for col in ['TAG', 'tag', 'celltype', 'cell_type', 'CellType']:
+                if col in df.columns:
+                    celltypes = df[col].tolist()
+                    break
 
     elif filepath.suffix == '.txt':
         with open(filepath, 'r') as f:
-            return [line.strip() for line in f if line.strip()]
+            sequences = [line.strip() for line in f if line.strip()]
 
     elif filepath.suffix in ['.fa', '.fasta']:
         sequences = []
@@ -900,10 +1570,13 @@ def load_sequences(filepath: str) -> List[str]:
                     current_seq.append(line.strip())
         if current_seq:
             sequences.append(''.join(current_seq))
-        return sequences
 
     else:
         raise ValueError(f"Unsupported file format: {filepath.suffix}")
+
+    if return_celltypes:
+        return sequences, celltypes
+    return sequences
 
 
 def main():
@@ -944,6 +1617,10 @@ Examples:
     parser.add_argument('--novelty-radii', nargs='+', type=int, default=[1, 2, 3, 5, 10, 15, 20],
                         help='Radii for novelty@r calculation')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--no-distributional', action='store_true',
+                        help='Skip distributional metrics (discriminator, Fréchet, MMD) for faster runs')
+    parser.add_argument('--celltype-fidelity', action='store_true',
+                        help='Compute cell-type conditional fidelity (requires TAG column in files)')
 
     args = parser.parse_args()
 
@@ -960,9 +1637,18 @@ Examples:
     evaluator = DNASequenceMetrics(config)
     visualizer = MetricsVisualizer(output_dir=str(output_dir / 'figures'))
 
-    # Load reference sequences
+    # Load reference sequences (with cell types if requested)
     print(f"Loading reference sequences from {args.reference}...")
-    reference_seqs = load_sequences(args.reference)
+    if args.celltype_fidelity:
+        reference_seqs, reference_celltypes = load_sequences(args.reference, return_celltypes=True)
+        if reference_celltypes is None:
+            print("WARNING: No cell type column (TAG) found in reference file. Disabling cell-type fidelity.")
+            args.celltype_fidelity = False
+        else:
+            print(f"Loaded {len(reference_seqs)} reference sequences with {len(set(reference_celltypes))} cell types")
+    else:
+        reference_seqs = load_sequences(args.reference)
+        reference_celltypes = None
     print(f"Loaded {len(reference_seqs)} reference sequences")
 
     # Load cluster assignments if provided
@@ -972,8 +1658,9 @@ Examples:
         cluster_assignments = cluster_df['cluster'].values
         print(f"Loaded cluster assignments: {len(np.unique(cluster_assignments))} clusters")
 
-    # Parse synthetic datasets
+    # Parse synthetic datasets (with cell types if requested)
     synthetic_datasets = {}
+    synthetic_celltypes = {}
     for spec in args.synthetic:
         if ':' in spec:
             name, path = spec.split(':', 1)
@@ -982,17 +1669,33 @@ Examples:
             path = spec
 
         print(f"\nLoading synthetic dataset '{name}' from {path}...")
-        synthetic_datasets[name] = load_sequences(path)
+        if args.celltype_fidelity:
+            seqs, celltypes = load_sequences(path, return_celltypes=True)
+            synthetic_datasets[name] = seqs
+            synthetic_celltypes[name] = celltypes
+            if celltypes is None:
+                print(f"WARNING: No cell type column (TAG) found in {path}.")
+            else:
+                print(f"Loaded {len(seqs)} sequences with {len(set(celltypes))} cell types")
+        else:
+            synthetic_datasets[name] = load_sequences(path)
         print(f"Loaded {len(synthetic_datasets[name])} sequences")
 
     # Run evaluation for each dataset
     all_results = {}
     for name, synth_seqs in synthetic_datasets.items():
+        # Get cell types for this dataset
+        ref_ct = reference_celltypes if args.celltype_fidelity else None
+        syn_ct = synthetic_celltypes.get(name) if args.celltype_fidelity else None
+
         results = evaluator.evaluate(
             reference_seqs,
             synth_seqs,
             query_name=name,
-            cluster_assignments=cluster_assignments
+            cluster_assignments=cluster_assignments,
+            reference_celltypes=ref_ct,
+            query_celltypes=syn_ct,
+            compute_distributional=not args.no_distributional
         )
         all_results[name] = results
 
@@ -1062,12 +1765,39 @@ Examples:
             'gc_difference': results['gc_content']['mean_difference'],
             'gc_pvalue': results['gc_content']['ttest_pvalue'],
         }
+
         # Add k-mer metrics
         for k in args.kmer_sizes:
             key = f'{k}-mer'
             if key in results['kmer']:
                 row[f'{k}mer_jsd'] = results['kmer'][key]['jensen_shannon_divergence']
                 row[f'{k}mer_cosine'] = results['kmer'][key]['cosine_similarity']
+
+        # Add distributional metrics (new)
+        if 'discriminator' in results:
+            row['discriminator_balanced_acc'] = results['discriminator']['balanced_accuracy']
+            row['discriminator_auc'] = results['discriminator']['roc_auc']
+            row['discriminator_interpretation'] = results['discriminator']['interpretation']
+
+        if 'frechet' in results:
+            row['frechet_distance'] = results['frechet']['frechet_distance']
+
+        if 'mmd' in results:
+            row['mmd_linear'] = results['mmd']['mmd_linear']
+            row['mmd_rbf'] = results['mmd']['mmd_rbf_median_gamma']
+
+        if 'precision_recall' in results:
+            row['precision'] = results['precision_recall']['precision']
+            row['recall'] = results['precision_recall']['recall']
+            row['f1_score'] = results['precision_recall']['f1_score']
+            row['coverage'] = results['precision_recall']['coverage']
+
+        # Add cell-type fidelity metrics
+        if 'celltype_fidelity' in results:
+            row['celltype_gt_accuracy'] = results['celltype_fidelity']['gt_accuracy']
+            row['celltype_synth_accuracy'] = results['celltype_fidelity']['synthetic_accuracy']
+            row['celltype_fidelity_gap'] = results['celltype_fidelity']['fidelity_gap']
+            row['celltype_interpretation'] = results['celltype_fidelity']['interpretation']
 
         summary_rows.append(row)
 
