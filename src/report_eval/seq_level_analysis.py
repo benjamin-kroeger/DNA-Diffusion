@@ -1,36 +1,31 @@
 #!/usr/bin/env python3
 """
-Script 1: Comprehensive DNA Sequence Metrics Evaluation
+Script 1: DNA Sequence Metrics Evaluation
 
 Computes sequence-level metrics comparing ground truth vs synthetic sequences:
-- Sequence novelty (Novelty@r for various radii)
-- Sequence diversity (mean pairwise Hamming distance)
-- K-mer frequency similarities (3, 5, 7, 9-mers)
+- K-mer frequency similarities (3, 5, 7, 9-mers) with Jensen-Shannon Divergence
 - GC content similarity
 - Discriminator accuracy (can a classifier distinguish real from synthetic?)
-- Fréchet distance (like FID for images, but for k-mer distributions)
-- Maximum Mean Discrepancy (MMD) - kernel-based distributional distance
-- Precision/Recall/Coverage for generative models
 
-Supports:
-- Multiple synthetic datasets (for comparing different models)
-- Per-cluster analysis (when cluster assignments are provided)
-- Publication-quality visualizations
+Metrics explained:
+- Discriminator: Trains a classifier on k-mer features to distinguish GT from synthetic.
+  If accuracy >> 50%, synthetic is detectably different from real.
+- K-mer JSD: Jensen-Shannon Divergence between k-mer frequency distributions.
+  Lower = more similar to reference.
+- GC Content: Basic compositional similarity.
 
 Author: DNA Diffusion Analysis Pipeline
 """
 
 import numpy as np
 import pandas as pd
-from collections import Counter, defaultdict
+from collections import Counter
 from typing import List, Dict, Tuple, Optional, Union
-from scipy.stats import entropy, ttest_ind, mannwhitneyu
+from scipy.stats import entropy, ttest_ind, mannwhitneyu, sem
 from scipy.spatial.distance import jensenshannon
-from scipy.linalg import sqrtm
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import cross_val_score, StratifiedKFold
-from sklearn.feature_extraction import DictVectorizer
 from sklearn.preprocessing import StandardScaler
 from dataclasses import dataclass, field
 import matplotlib.pyplot as plt
@@ -38,7 +33,6 @@ import seaborn as sns
 from pathlib import Path
 import json
 import warnings
-from tqdm import tqdm
 import argparse
 
 warnings.filterwarnings('ignore')
@@ -64,164 +58,20 @@ plt.rcParams.update({
 class EvaluationConfig:
     """Configuration for evaluation parameters."""
     kmer_sizes: List[int] = field(default_factory=lambda: [3, 5, 7, 9])
-    novelty_radii: List[int] = field(default_factory=lambda: [1, 2, 3, 5, 10, 15, 20])
     sequence_length: int = 200
-    n_diversity_samples: int = 2000  # Sample for pairwise diversity (full is O(n^2))
     random_seed: int = 42
 
 
 class DNASequenceMetrics:
     """
-    Comprehensive DNA sequence metrics calculator.
+    DNA sequence metrics calculator for evaluating generative models.
 
-    Computes novelty, diversity, k-mer frequencies, and GC content
-    with support for per-cluster analysis.
+    Computes k-mer frequencies, GC content, and discriminator accuracy.
     """
 
     def __init__(self, config: Optional[EvaluationConfig] = None):
         self.config = config or EvaluationConfig()
         np.random.seed(self.config.random_seed)
-
-        # Nucleotide encoding for vectorized operations
-        self._nuc_to_int = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 4,
-                            'a': 0, 'c': 1, 'g': 2, 't': 3, 'n': 4}
-
-    # ==================== Vectorized Sequence Operations ====================
-
-    def _encode_sequences(self, sequences: List[str]) -> np.ndarray:
-        """
-        Encode sequences as integer matrix for vectorized operations.
-
-        Args:
-            sequences: List of DNA sequences (must be same length)
-
-        Returns:
-            np.ndarray of shape (n_sequences, seq_length) with dtype uint8
-        """
-        n_seqs = len(sequences)
-        seq_len = len(sequences[0])
-
-        # Pre-allocate array
-        encoded = np.zeros((n_seqs, seq_len), dtype=np.uint8)
-
-        for i, seq in enumerate(sequences):
-            for j, nuc in enumerate(seq):
-                encoded[i, j] = self._nuc_to_int.get(nuc, 4)
-
-        return encoded
-
-    def _encode_sequences_fast(self, sequences: List[str]) -> np.ndarray:
-        """
-        Fast encoding using numpy's vectorized string operations.
-        """
-        # Convert to numpy array of characters
-        n_seqs = len(sequences)
-        seq_len = len(sequences[0])
-
-        # Create byte array from sequences
-        seq_bytes = np.array([list(s.upper()) for s in sequences], dtype='U1')
-
-        # Map to integers
-        encoded = np.zeros((n_seqs, seq_len), dtype=np.uint8)
-        encoded[seq_bytes == 'A'] = 0
-        encoded[seq_bytes == 'C'] = 1
-        encoded[seq_bytes == 'G'] = 2
-        encoded[seq_bytes == 'T'] = 3
-        encoded[seq_bytes == 'N'] = 4
-
-        return encoded
-
-    def _hamming_distance_matrix(self,
-                                 seqs1_encoded: np.ndarray,
-                                 seqs2_encoded: np.ndarray,
-                                 batch_size: int = 1000) -> np.ndarray:
-        """
-        Compute pairwise Hamming distances between two sets of encoded sequences.
-
-        Uses batched computation to manage memory for large datasets.
-
-        Args:
-            seqs1_encoded: (n1, L) encoded sequences
-            seqs2_encoded: (n2, L) encoded sequences
-            batch_size: Process this many query sequences at a time
-
-        Returns:
-            (n1, n2) matrix of Hamming distances
-        """
-        n1, seq_len = seqs1_encoded.shape
-        n2 = seqs2_encoded.shape[0]
-
-        # For small datasets, compute directly
-        if n1 * n2 < 10_000_000:  # ~10M comparisons threshold
-            # Broadcasting: (n1, 1, L) != (1, n2, L) -> (n1, n2, L)
-            # Sum over L to get (n1, n2) distances
-            distances = np.sum(seqs1_encoded[:, np.newaxis, :] != seqs2_encoded[np.newaxis, :, :], axis=2)
-            return distances
-
-        # For large datasets, batch to avoid memory issues
-        distances = np.zeros((n1, n2), dtype=np.int32)
-
-        for i in range(0, n1, batch_size):
-            end_i = min(i + batch_size, n1)
-            batch1 = seqs1_encoded[i:end_i]
-
-            # Compute distances for this batch
-            batch_dist = np.sum(batch1[:, np.newaxis, :] != seqs2_encoded[np.newaxis, :, :], axis=2)
-            distances[i:end_i] = batch_dist
-
-        return distances
-
-    def _min_hamming_distances_vectorized(self,
-                                          query_encoded: np.ndarray,
-                                          reference_encoded: np.ndarray,
-                                          batch_size: int = 500,
-                                          show_progress: bool = True) -> np.ndarray:
-        """
-        Compute minimum Hamming distance from each query to any reference.
-
-        Optimized for the novelty computation use case.
-
-        Args:
-            query_encoded: (n_query, L) encoded query sequences
-            reference_encoded: (n_ref, L) encoded reference sequences
-            batch_size: Process this many queries at a time
-            show_progress: Show progress bar
-
-        Returns:
-            (n_query,) array of minimum distances
-        """
-        n_query = query_encoded.shape[0]
-        n_ref = reference_encoded.shape[0]
-
-        min_distances = np.zeros(n_query, dtype=np.int32)
-
-        # Process in batches
-        n_batches = (n_query + batch_size - 1) // batch_size
-
-        if show_progress:
-            from tqdm import tqdm
-            batch_iter = tqdm(range(n_batches), desc="Computing novelty (vectorized)")
-        else:
-            batch_iter = range(n_batches)
-
-        for batch_idx in batch_iter:
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, n_query)
-
-            query_batch = query_encoded[start_idx:end_idx]
-
-            # Compute all distances for this batch: (batch_size, n_ref)
-            # Using broadcasting: (batch, 1, L) != (1, n_ref, L) -> (batch, n_ref, L)
-            # Sum over L -> (batch, n_ref)
-            batch_distances = np.sum(
-                query_batch[:, np.newaxis, :] != reference_encoded[np.newaxis, :, :],
-                axis=2
-            )
-
-            # Get minimum for each query in batch
-            min_distances[start_idx:end_idx] = np.min(batch_distances, axis=1)
-
-        return min_distances
 
     # ==================== Core Metric Functions ====================
 
@@ -231,11 +81,6 @@ class DNASequenceMetrics:
         seq = seq.upper()
         gc_count = seq.count('G') + seq.count('C')
         return gc_count / len(seq) if len(seq) > 0 else 0
-
-    @staticmethod
-    def hamming_distance(seq1: str, seq2: str) -> int:
-        """Compute Hamming distance between two sequences."""
-        return sum(c1 != c2 for c1, c2 in zip(seq1.upper(), seq2.upper()))
 
     @staticmethod
     def get_kmers(seq: str, k: int) -> List[str]:
@@ -258,142 +103,26 @@ class DNASequenceMetrics:
         norm1, norm2 = np.linalg.norm(vec1), np.linalg.norm(vec2)
         return dot_product / (norm1 * norm2 + 1e-10)
 
-    # ==================== Novelty Metrics ====================
-
-    def compute_novelty(self,
-                        reference_seqs: List[str],
-                        query_seqs: List[str],
-                        show_progress: bool = True) -> Dict:
-        """
-        Compute Novelty@r metrics using vectorized operations.
-
-        Novelty@r = fraction of query sequences with min Hamming distance > r from reference.
-
-        This implementation uses numpy broadcasting for ~100x speedup over naive loops.
-        """
-        # Validate sequence lengths
-        ref_len = len(reference_seqs[0])
-        query_len = len(query_seqs[0])
-
-        if ref_len != query_len:
-            raise ValueError(f"Reference and query sequences must have same length. "
-                             f"Got {ref_len} and {query_len}")
-
-        # Encode sequences for vectorized computation
-        if show_progress:
-            print("  Encoding sequences...")
-
-        reference_encoded = self._encode_sequences_fast(reference_seqs)
-        query_encoded = self._encode_sequences_fast(query_seqs)
-
-        # Compute minimum distances using vectorized method
-        min_distances = self._min_hamming_distances_vectorized(
-            query_encoded, reference_encoded,
-            batch_size=500, show_progress=show_progress
-        )
-
-        results = {
-            'min_distance_mean': float(np.mean(min_distances)),
-            'min_distance_std': float(np.std(min_distances)),
-            'min_distance_median': float(np.median(min_distances)),
-            'min_distance_distribution': min_distances.tolist(),
-        }
-
-        # Compute novelty@r for each radius
-        for r in self.config.novelty_radii:
-            results[f'novelty@{r}'] = float(np.mean(min_distances > r))
-
-        return results
-
     # ==================== Diversity Metrics ====================
 
-    def compute_diversity(self,
-                          sequences: List[str],
-                          show_progress: bool = True) -> Dict:
-        """
-        Compute diversity metrics using pairwise Hamming distances.
-
-        Uses vectorized operations for speed. For large datasets, samples
-        sequences to avoid O(n^2) memory issues.
-        """
+    def compute_diversity(self, sequences: List[str]) -> Dict:
+        """Compute diversity metrics for a set of sequences."""
         n = len(sequences)
-        seq_len = len(sequences[0]) if sequences else self.config.sequence_length
 
         if n < 2:
             return {
-                'mean_pairwise_hamming': 0.0,
-                'std_pairwise_hamming': 0.0,
                 'unique_ratio': 1.0,
                 'shannon_entropy': 0.0,
             }
 
-        # Determine if we need to sample
-        max_seqs_for_full = self.config.n_diversity_samples
-
-        if n > max_seqs_for_full:
-            # Sample sequences for diversity computation
-            if show_progress:
-                print(f"  Sampling {max_seqs_for_full} sequences for diversity...")
-            sample_idx = np.random.choice(n, max_seqs_for_full, replace=False)
-            sample_seqs = [sequences[i] for i in sample_idx]
-        else:
-            sample_seqs = sequences
-
-        # Encode sampled sequences
-        if show_progress:
-            print("  Encoding sequences for diversity...")
-        encoded = self._encode_sequences_fast(sample_seqs)
-        n_sample = len(sample_seqs)
-
-        # Compute pairwise distances using vectorized method
-        # For diversity we need upper triangle of distance matrix
-        if show_progress:
-            print("  Computing pairwise distances (vectorized)...")
-
-        # Batch computation to manage memory
-        batch_size = min(500, n_sample)
-        pairwise_distances = []
-
-        n_batches = (n_sample + batch_size - 1) // batch_size
-
-        if show_progress:
-            from tqdm import tqdm
-            batch_iter = tqdm(range(n_batches), desc="Computing diversity")
-        else:
-            batch_iter = range(n_batches)
-
-        for batch_idx in batch_iter:
-            start_i = batch_idx * batch_size
-            end_i = min(start_i + batch_size, n_sample)
-
-            # Compute distances from batch to all sequences after it
-            batch = encoded[start_i:end_i]
-
-            # Compare with sequences from start_i onwards to get upper triangle
-            for i_local, i_global in enumerate(range(start_i, end_i)):
-                # Only compare with sequences that come after this one
-                if i_global + 1 < n_sample:
-                    remaining = encoded[i_global + 1:]
-                    # Compute distances: (1, L) vs (n_remaining, L)
-                    dists = np.sum(batch[i_local:i_local + 1] != remaining, axis=1) / seq_len
-                    pairwise_distances.extend(dists.tolist())
-
-        pairwise_distances = np.array(pairwise_distances)
-
-        # Unique sequences ratio (on full dataset)
         unique_ratio = len(set(sequences)) / len(sequences)
-
-        # Shannon entropy of sequence distribution
         seq_counter = Counter(sequences)
         seq_probs = np.array(list(seq_counter.values())) / len(sequences)
         shannon_ent = entropy(seq_probs)
 
         return {
-            'mean_pairwise_hamming': float(np.mean(pairwise_distances)),
-            'std_pairwise_hamming': float(np.std(pairwise_distances)),
             'unique_ratio': float(unique_ratio),
             'shannon_entropy': float(shannon_ent),
-            'pairwise_distribution': pairwise_distances.tolist(),
         }
 
     # ==================== K-mer Analysis ====================
@@ -421,17 +150,11 @@ class DNASequenceMetrics:
             jsd = jensenshannon(ref_vec, query_vec)
             cos_sim = self.cosine_similarity(ref_vec, query_vec)
 
-            # Overlap ratio
-            shared = len(set(ref_dist.keys()) & set(query_dist.keys()))
-            overlap = shared / len(all_kmers) if all_kmers else 0
-
             results[f'{k}-mer'] = {
                 'jensen_shannon_divergence': float(jsd),
                 'cosine_similarity': float(cos_sim),
-                'overlap_ratio': float(overlap),
                 'n_unique_reference': len(ref_dist),
                 'n_unique_query': len(query_dist),
-                'n_shared': shared,
             }
 
         return results
@@ -445,45 +168,33 @@ class DNASequenceMetrics:
         ref_gc = np.array([self.compute_gc_content(s) for s in reference_seqs])
         query_gc = np.array([self.compute_gc_content(s) for s in query_seqs])
 
-        # Statistical tests
         ttest = ttest_ind(ref_gc, query_gc)
         mwu = mannwhitneyu(ref_gc, query_gc, alternative='two-sided')
 
         return {
             'reference_mean': float(np.mean(ref_gc)),
             'reference_std': float(np.std(ref_gc)),
+            'reference_se': float(sem(ref_gc)),
             'query_mean': float(np.mean(query_gc)),
             'query_std': float(np.std(query_gc)),
+            'query_se': float(sem(query_gc)),
             'mean_difference': float(np.mean(query_gc) - np.mean(ref_gc)),
             'ttest_statistic': float(ttest.statistic),
             'ttest_pvalue': float(ttest.pvalue),
             'mannwhitney_pvalue': float(mwu.pvalue),
-            'reference_distribution': ref_gc.tolist(),
-            'query_distribution': query_gc.tolist(),
         }
 
-    # ==================== Distributional Distance Metrics ====================
+    # ==================== K-mer Feature Extraction ====================
 
     def _get_kmer_feature_vectors(self,
                                   sequences: List[str],
                                   k: int = 4) -> np.ndarray:
-        """
-        Convert sequences to k-mer frequency vectors for distributional comparisons.
-
-        Args:
-            sequences: List of DNA sequences
-            k: k-mer size (default 4 for 256 features)
-
-        Returns:
-            (n_sequences, 4^k) array of k-mer frequencies
-        """
-        # Generate all possible k-mers
+        """Convert sequences to k-mer frequency vectors."""
         from itertools import product
         all_kmers = [''.join(p) for p in product('ACGT', repeat=k)]
         kmer_to_idx = {km: i for i, km in enumerate(all_kmers)}
         n_kmers = len(all_kmers)
 
-        # Build feature matrix
         X = np.zeros((len(sequences), n_kmers), dtype=np.float32)
 
         for i, seq in enumerate(sequences):
@@ -491,7 +202,7 @@ class DNASequenceMetrics:
             kmer_counts = Counter()
             for j in range(len(seq) - k + 1):
                 kmer = seq[j:j + k]
-                if kmer in kmer_to_idx:  # Skip k-mers with N
+                if kmer in kmer_to_idx:
                     kmer_counts[kmer] += 1
 
             total = sum(kmer_counts.values())
@@ -500,6 +211,8 @@ class DNASequenceMetrics:
                     X[i, kmer_to_idx[kmer]] = count / total
 
         return X
+
+    # ==================== Discriminator Metrics ====================
 
     def compute_discriminator_metrics(self,
                                       reference_seqs: List[str],
@@ -510,26 +223,16 @@ class DNASequenceMetrics:
         """
         Train a classifier to distinguish real from synthetic sequences.
 
-        If accuracy >> 50%, the synthetic data is distinguishable from real.
-        This is a direct measure of generation quality.
-
-        Uses BALANCED sampling to ensure fair comparison regardless of
-        dataset sizes.
-
-        Args:
-            reference_seqs: Ground truth sequences (label=0)
-            query_seqs: Synthetic sequences (label=1)
-            k: k-mer size for features
-            n_samples: Max samples per class (for speed)
+        If accuracy >> 50%, the synthetic data is detectably different from real.
+        Uses balanced sampling and balanced accuracy for fair evaluation.
 
         Returns:
-            Dictionary with classifier accuracies and feature importances
+            Dictionary with balanced accuracy, AUC, and top discriminating k-mers
         """
         if show_progress:
             print("  Building k-mer feature vectors...")
 
-        # BALANCED SAMPLING: Use equal numbers from each class
-        # Take minimum of: n_samples, len(reference), len(query)
+        # Balanced sampling
         n_per_class = min(n_samples, len(reference_seqs), len(query_seqs))
 
         if show_progress:
@@ -553,7 +256,7 @@ class DNASequenceMetrics:
         X_ref = self._get_kmer_feature_vectors(ref_sample, k)
         X_query = self._get_kmer_feature_vectors(query_sample, k)
 
-        # Combine and create labels (balanced: 50% each class)
+        # Combine and create labels
         X = np.vstack([X_ref, X_query])
         y = np.array([0] * len(X_ref) + [1] * len(X_query))
 
@@ -567,340 +270,63 @@ class DNASequenceMetrics:
         X_scaled = scaler.fit_transform(X)
 
         if show_progress:
-            print("  Training classifiers with cross-validation (balanced classes)...")
+            print("  Training classifiers with 5-fold cross-validation...")
 
-        # Train Random Forest with class balancing
+        # Train Random Forest
         rf = RandomForestClassifier(n_estimators=100, max_depth=10,
                                     class_weight='balanced', random_state=42, n_jobs=-1)
         cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-        # Use balanced_accuracy_score for proper evaluation
         rf_scores = cross_val_score(rf, X_scaled, y, cv=cv, scoring='balanced_accuracy')
-
-        # Also get ROC-AUC which is threshold-independent
         rf_auc_scores = cross_val_score(rf, X_scaled, y, cv=cv, scoring='roc_auc')
 
-        # Train Logistic Regression with class balancing
+        # Train Logistic Regression
         lr = LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42)
         lr_scores = cross_val_score(lr, X_scaled, y, cv=cv, scoring='balanced_accuracy')
         lr_auc_scores = cross_val_score(lr, X_scaled, y, cv=cv, scoring='roc_auc')
 
-        # Train final RF to get feature importances
+        # Get feature importances from final RF model
         rf.fit(X_scaled, y)
-
-        # Get top discriminating k-mers
         from itertools import product
         all_kmers = [''.join(p) for p in product('ACGT', repeat=k)]
         importance_idx = np.argsort(rf.feature_importances_)[::-1][:20]
         top_kmers = [(all_kmers[i], float(rf.feature_importances_[i])) for i in importance_idx]
 
-        # Interpretation based on balanced accuracy
         rf_acc = float(np.mean(rf_scores))
+        rf_acc_std = float(np.std(rf_scores))
         rf_auc = float(np.mean(rf_auc_scores))
+        rf_auc_std = float(np.std(rf_auc_scores))
 
-        interpretation = "indistinguishable (good!)" if rf_acc < 0.55 else \
-            "slightly distinguishable" if rf_acc < 0.60 else \
-                "moderately distinguishable" if rf_acc < 0.70 else \
-                    "highly distinguishable" if rf_acc < 0.80 else \
-                        "very easily distinguishable (poor generation)"
+        # Interpretation
+        if rf_acc < 0.55:
+            interpretation = "indistinguishable (excellent generation)"
+        elif rf_acc < 0.60:
+            interpretation = "slightly distinguishable"
+        elif rf_acc < 0.70:
+            interpretation = "moderately distinguishable"
+        elif rf_acc < 0.80:
+            interpretation = "highly distinguishable"
+        else:
+            interpretation = "very easily distinguishable (poor generation)"
 
         return {
             'balanced_accuracy': rf_acc,
-            'balanced_accuracy_std': float(np.std(rf_scores)),
+            'balanced_accuracy_std': rf_acc_std,
+            'balanced_accuracy_ci95': (rf_acc - 1.96 * rf_acc_std, rf_acc + 1.96 * rf_acc_std),
             'roc_auc': rf_auc,
-            'roc_auc_std': float(np.std(rf_auc_scores)),
+            'roc_auc_std': rf_auc_std,
+            'roc_auc_ci95': (rf_auc - 1.96 * rf_auc_std, rf_auc + 1.96 * rf_auc_std),
             'logistic_regression_balanced_acc': float(np.mean(lr_scores)),
             'logistic_regression_auc': float(np.mean(lr_auc_scores)),
-            'baseline_accuracy': 0.5,  # Random chance with balanced classes
+            'baseline_accuracy': 0.5,
             'interpretation': interpretation,
             'top_discriminating_kmers': top_kmers,
             'kmer_size': k,
             'n_per_class': n_per_class,
-            'total_samples': len(X),
+            'cv_folds': 5,
         }
 
-    def compute_frechet_distance(self,
-                                 reference_seqs: List[str],
-                                 query_seqs: List[str],
-                                 k: int = 4,
-                                 show_progress: bool = True) -> Dict:
-        """
-        Compute Fréchet Distance on k-mer distributions.
-
-        Analogous to FID (Fréchet Inception Distance) for images.
-        Lower values indicate more similar distributions.
-
-        FD = ||μ_r - μ_q||² + Tr(Σ_r + Σ_q - 2(Σ_r Σ_q)^(1/2))
-
-        Args:
-            reference_seqs: Ground truth sequences
-            query_seqs: Synthetic sequences
-            k: k-mer size for features
-
-        Returns:
-            Dictionary with Fréchet distance and component metrics
-        """
-        if show_progress:
-            print("  Computing k-mer feature vectors...")
-
-        X_ref = self._get_kmer_feature_vectors(reference_seqs, k)
-        X_query = self._get_kmer_feature_vectors(query_seqs, k)
-
-        if show_progress:
-            print("  Computing distribution statistics...")
-
-        # Compute means
-        mu_ref = np.mean(X_ref, axis=0)
-        mu_query = np.mean(X_query, axis=0)
-
-        # Compute covariances (with regularization for numerical stability)
-        sigma_ref = np.cov(X_ref, rowvar=False) + np.eye(X_ref.shape[1]) * 1e-6
-        sigma_query = np.cov(X_query, rowvar=False) + np.eye(X_query.shape[1]) * 1e-6
-
-        if show_progress:
-            print("  Computing Fréchet distance...")
-
-        # Mean difference term
-        mean_diff = np.sum((mu_ref - mu_query) ** 2)
-
-        # Covariance term
-        try:
-            # Compute sqrt of product of covariances
-            covmean = sqrtm(sigma_ref @ sigma_query)
-
-            # Handle numerical issues (imaginary parts from sqrtm)
-            if np.iscomplexobj(covmean):
-                covmean = covmean.real
-
-            cov_term = np.trace(sigma_ref + sigma_query - 2 * covmean)
-        except Exception as e:
-            # Fallback: just use trace difference
-            print(f"  Warning: sqrtm failed ({e}), using simplified metric")
-            cov_term = np.trace(sigma_ref) + np.trace(sigma_query)
-
-        frechet_distance = float(mean_diff + cov_term)
-
-        return {
-            'frechet_distance': frechet_distance,
-            'mean_difference_term': float(mean_diff),
-            'covariance_term': float(cov_term),
-            'kmer_size': k,
-            'feature_dim': X_ref.shape[1],
-        }
-
-    def compute_mmd(self,
-                    reference_seqs: List[str],
-                    query_seqs: List[str],
-                    k: int = 4,
-                    n_samples: int = 2000,
-                    show_progress: bool = True) -> Dict:
-        """
-        Compute Maximum Mean Discrepancy (MMD) between distributions.
-
-        MMD is a kernel-based distance between distributions.
-        MMD = 0 indicates identical distributions.
-
-        Args:
-            reference_seqs: Ground truth sequences
-            query_seqs: Synthetic sequences
-            k: k-mer size for features
-            n_samples: Max samples (MMD is O(n²))
-
-        Returns:
-            Dictionary with MMD values for different kernels
-        """
-        if show_progress:
-            print("  Computing k-mer feature vectors...")
-
-        # Sample for computational efficiency
-        if len(reference_seqs) > n_samples:
-            ref_idx = np.random.choice(len(reference_seqs), n_samples, replace=False)
-            ref_sample = [reference_seqs[i] for i in ref_idx]
-        else:
-            ref_sample = reference_seqs
-
-        if len(query_seqs) > n_samples:
-            query_idx = np.random.choice(len(query_seqs), n_samples, replace=False)
-            query_sample = [query_seqs[i] for i in query_idx]
-        else:
-            query_sample = query_seqs
-
-        X_ref = self._get_kmer_feature_vectors(ref_sample, k)
-        X_query = self._get_kmer_feature_vectors(query_sample, k)
-
-        if show_progress:
-            print("  Computing MMD with RBF kernel...")
-
-        def rbf_kernel(X, Y, gamma):
-            """Compute RBF kernel between X and Y."""
-            # ||x - y||² = ||x||² + ||y||² - 2<x,y>
-            X_sqnorm = np.sum(X ** 2, axis=1)
-            Y_sqnorm = np.sum(Y ** 2, axis=1)
-
-            # Pairwise squared distances
-            sq_dist = X_sqnorm[:, np.newaxis] + Y_sqnorm[np.newaxis, :] - 2 * X @ Y.T
-
-            return np.exp(-gamma * sq_dist)
-
-        def compute_mmd_rbf(X, Y, gamma):
-            """Compute MMD² with RBF kernel."""
-            K_XX = rbf_kernel(X, X, gamma)
-            K_YY = rbf_kernel(Y, Y, gamma)
-            K_XY = rbf_kernel(X, Y, gamma)
-
-            n = len(X)
-            m = len(Y)
-
-            # MMD² = E[k(x,x')] + E[k(y,y')] - 2E[k(x,y)]
-            # Use unbiased estimator (exclude diagonal for K_XX and K_YY)
-            mmd_sq = (np.sum(K_XX) - np.trace(K_XX)) / (n * (n - 1)) + \
-                     (np.sum(K_YY) - np.trace(K_YY)) / (m * (m - 1)) - \
-                     2 * np.mean(K_XY)
-
-            return max(0, mmd_sq)  # Ensure non-negative
-
-        # Compute median heuristic for gamma
-        from scipy.spatial.distance import pdist
-        all_data = np.vstack([X_ref[:500], X_query[:500]])  # Subsample for median
-        pairwise_dists = pdist(all_data, 'sqeuclidean')
-        median_dist = np.median(pairwise_dists)
-        gamma_median = 1.0 / (median_dist + 1e-10)
-
-        # Compute MMD with different gamma values
-        mmd_results = {}
-        for gamma_mult, name in [(0.1, 'small'), (1.0, 'median'), (10.0, 'large')]:
-            gamma = gamma_median * gamma_mult
-            mmd_sq = compute_mmd_rbf(X_ref, X_query, gamma)
-            mmd_results[f'mmd_{name}_gamma'] = float(np.sqrt(mmd_sq))
-
-        # Linear kernel MMD (simpler, faster)
-        if show_progress:
-            print("  Computing MMD with linear kernel...")
-
-        mean_ref = np.mean(X_ref, axis=0)
-        mean_query = np.mean(X_query, axis=0)
-        mmd_linear = float(np.sqrt(np.sum((mean_ref - mean_query) ** 2)))
-
-        return {
-            'mmd_linear': mmd_linear,
-            'mmd_rbf_small_gamma': mmd_results['mmd_small_gamma'],
-            'mmd_rbf_median_gamma': mmd_results['mmd_median_gamma'],
-            'mmd_rbf_large_gamma': mmd_results['mmd_large_gamma'],
-            'kmer_size': k,
-            'n_reference_samples': len(ref_sample),
-            'n_query_samples': len(query_sample),
-        }
-
-    def compute_precision_recall_density_coverage(self,
-                                                  reference_seqs: List[str],
-                                                  query_seqs: List[str],
-                                                  k: int = 4,
-                                                  n_neighbors: int = 5,
-                                                  n_samples: int = 5000,
-                                                  show_progress: bool = True) -> Dict:
-        """
-        Compute Precision, Recall, Density, and Coverage metrics.
-
-        These metrics measure:
-        - Precision: fraction of synthetic samples that are realistic (near real data)
-        - Recall: fraction of real data modes covered by synthetic
-        - Density: how many real samples are near each synthetic sample
-        - Coverage: fraction of real samples with a synthetic neighbor
-
-        Based on "Improved Precision and Recall Metric for Assessing Generative Models"
-
-        Args:
-            reference_seqs: Ground truth sequences
-            query_seqs: Synthetic sequences
-            k: k-mer size for features
-            n_neighbors: Number of neighbors for manifold estimation
-            n_samples: Max samples per dataset
-
-        Returns:
-            Dictionary with precision, recall, density, coverage
-        """
-        from sklearn.neighbors import NearestNeighbors
-
-        if show_progress:
-            print("  Computing k-mer feature vectors...")
-
-        # Sample if needed
-        if len(reference_seqs) > n_samples:
-            ref_idx = np.random.choice(len(reference_seqs), n_samples, replace=False)
-            ref_sample = [reference_seqs[i] for i in ref_idx]
-        else:
-            ref_sample = reference_seqs
-
-        if len(query_seqs) > n_samples:
-            query_idx = np.random.choice(len(query_seqs), n_samples, replace=False)
-            query_sample = [query_seqs[i] for i in query_idx]
-        else:
-            query_sample = query_seqs
-
-        X_ref = self._get_kmer_feature_vectors(ref_sample, k)
-        X_query = self._get_kmer_feature_vectors(query_sample, k)
-
-        if show_progress:
-            print("  Computing nearest neighbor manifolds...")
-
-        # Fit nearest neighbors on reference
-        nn_ref = NearestNeighbors(n_neighbors=n_neighbors + 1, algorithm='auto')
-        nn_ref.fit(X_ref)
-
-        # Get distances to k-th nearest neighbor for each reference point (manifold radius)
-        ref_distances, _ = nn_ref.kneighbors(X_ref)
-        ref_radii = ref_distances[:, -1]  # k-th neighbor distance
-
-        # Fit nearest neighbors on query
-        nn_query = NearestNeighbors(n_neighbors=n_neighbors + 1, algorithm='auto')
-        nn_query.fit(X_query)
-
-        query_distances, _ = nn_query.kneighbors(X_query)
-        query_radii = query_distances[:, -1]
-
-        if show_progress:
-            print("  Computing precision and recall...")
-
-        # Precision: fraction of query points within reference manifold
-        query_to_ref_dist, query_to_ref_idx = nn_ref.kneighbors(X_query, n_neighbors=1)
-        query_to_ref_dist = query_to_ref_dist.flatten()
-        query_to_ref_idx = query_to_ref_idx.flatten()
-
-        # Query point is "realistic" if within radius of its nearest reference
-        precision_mask = query_to_ref_dist <= ref_radii[query_to_ref_idx]
-        precision = float(np.mean(precision_mask))
-
-        # Recall: fraction of reference points with query neighbor within their radius
-        ref_to_query_dist, _ = nn_query.kneighbors(X_ref, n_neighbors=1)
-        ref_to_query_dist = ref_to_query_dist.flatten()
-
-        recall_mask = ref_to_query_dist <= ref_radii
-        recall = float(np.mean(recall_mask))
-
-        # Density: average number of reference points near each query point
-        # (measures how well synthetic concentrates in high-density regions)
-        density_counts = np.sum(query_to_ref_dist[:, np.newaxis] <= ref_radii[np.newaxis, :], axis=1)
-        density = float(np.mean(density_counts) / n_neighbors)
-
-        # Coverage: fraction of reference points that have at least one query neighbor
-        coverage = float(np.mean(recall_mask))  # Same as recall in this formulation
-
-        # F1 score
-        f1 = 2 * precision * recall / (precision + recall + 1e-10)
-
-        return {
-            'precision': precision,
-            'recall': recall,
-            'f1_score': float(f1),
-            'density': density,
-            'coverage': coverage,
-            'n_neighbors': n_neighbors,
-            'kmer_size': k,
-            'n_reference_samples': len(ref_sample),
-            'n_query_samples': len(query_sample),
-        }
-
-    # ==================== Cell-Type Conditional Fidelity ====================
+    # ==================== Cell-Type Fidelity ====================
 
     def compute_celltype_fidelity(self,
                                   reference_seqs: List[str],
@@ -910,34 +336,13 @@ class DNASequenceMetrics:
                                   k: int = 4,
                                   test_size: float = 0.2,
                                   show_progress: bool = True) -> Dict:
-        """
-        Measure how well synthetic sequences preserve cell-type specificity.
-
-        Approach:
-        1. Train a classifier on GT sequences to predict cell type
-        2. Test on held-out GT → baseline accuracy
-        3. Test on synthetic → if accuracy drops, synthetic loses cell-type identity
-
-        The GAP between GT and synthetic accuracy measures conditional generation fidelity.
-
-        Args:
-            reference_seqs: Ground truth sequences
-            reference_celltypes: Cell type labels for GT (e.g., from TAG column)
-            query_seqs: Synthetic sequences
-            query_celltypes: Conditioned cell type labels for synthetic
-            k: k-mer size for features
-            test_size: Fraction of GT to hold out for testing
-
-        Returns:
-            Dictionary with accuracies and fidelity gap
-        """
+        """Measure how well synthetic sequences preserve cell-type specificity."""
         from sklearn.model_selection import train_test_split
         from sklearn.preprocessing import LabelEncoder
 
         if show_progress:
             print("  Building k-mer feature vectors for cell-type classification...")
 
-        # Encode cell types
         le = LabelEncoder()
         all_celltypes = list(set(reference_celltypes) | set(query_celltypes))
         le.fit(all_celltypes)
@@ -950,64 +355,31 @@ class DNASequenceMetrics:
         if show_progress:
             print(f"  Found {n_classes} cell types: {list(le.classes_)}")
 
-        # Get features
         X_ref = self._get_kmer_feature_vectors(reference_seqs, k)
         X_query = self._get_kmer_feature_vectors(query_seqs, k)
 
-        # Split GT into train/test
         X_train, X_test_gt, y_train, y_test_gt = train_test_split(
             X_ref, ref_labels, test_size=test_size, stratify=ref_labels, random_state=42
         )
 
-        if show_progress:
-            print(f"  Training set: {len(X_train)} sequences")
-            print(f"  GT test set: {len(X_test_gt)} sequences")
-            print(f"  Synthetic test set: {len(X_query)} sequences")
-
-        # Standardize
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X_train)
         X_test_gt_scaled = scaler.transform(X_test_gt)
         X_query_scaled = scaler.transform(X_query)
 
         if show_progress:
-            print("  Training Random Forest classifier on GT...")
+            print("  Training classifier on GT...")
 
-        # Train classifier on GT
         rf = RandomForestClassifier(n_estimators=100, max_depth=15,
                                     class_weight='balanced', random_state=42, n_jobs=-1)
         rf.fit(X_train_scaled, y_train)
 
-        # Test on held-out GT
         gt_accuracy = rf.score(X_test_gt_scaled, y_test_gt)
-        gt_predictions = rf.predict(X_test_gt_scaled)
-
-        # Test on synthetic
         synth_accuracy = rf.score(X_query_scaled, query_labels)
-        synth_predictions = rf.predict(X_query_scaled)
 
-        # Compute per-class accuracies
-        gt_per_class = {}
-        synth_per_class = {}
-
-        for i, celltype in enumerate(le.classes_):
-            # GT
-            gt_mask = y_test_gt == i
-            if gt_mask.sum() > 0:
-                gt_per_class[celltype] = float((gt_predictions[gt_mask] == i).mean())
-
-            # Synthetic
-            synth_mask = query_labels == i
-            if synth_mask.sum() > 0:
-                synth_per_class[celltype] = float((synth_predictions[synth_mask] == i).mean())
-
-        # Fidelity gap
         fidelity_gap = gt_accuracy - synth_accuracy
-
-        # Baseline (random) accuracy
         baseline = 1.0 / n_classes
 
-        # Interpretation
         if fidelity_gap < 0.05:
             interpretation = "excellent - synthetic preserves cell-type specificity"
         elif fidelity_gap < 0.10:
@@ -1017,41 +389,14 @@ class DNASequenceMetrics:
         else:
             interpretation = "poor - synthetic loses cell-type identity"
 
-        # Also train logistic regression for comparison
-        lr = LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42)
-        lr.fit(X_train_scaled, y_train)
-        gt_accuracy_lr = lr.score(X_test_gt_scaled, y_test_gt)
-        synth_accuracy_lr = lr.score(X_query_scaled, query_labels)
-
-        # Confusion analysis: what cell types get confused?
-        from collections import Counter
-        synth_confusion = Counter()
-        for true_label, pred_label in zip(query_labels, synth_predictions):
-            if true_label != pred_label:
-                true_name = le.classes_[true_label]
-                pred_name = le.classes_[pred_label]
-                synth_confusion[f"{true_name}→{pred_name}"] += 1
-
-        top_confusions = synth_confusion.most_common(5)
-
         return {
             'gt_accuracy': float(gt_accuracy),
             'synthetic_accuracy': float(synth_accuracy),
             'fidelity_gap': float(fidelity_gap),
             'baseline_accuracy': float(baseline),
             'interpretation': interpretation,
-            'gt_accuracy_lr': float(gt_accuracy_lr),
-            'synthetic_accuracy_lr': float(synth_accuracy_lr),
-            'fidelity_gap_lr': float(gt_accuracy_lr - synth_accuracy_lr),
             'n_classes': n_classes,
             'cell_types': list(le.classes_),
-            'gt_per_class_accuracy': gt_per_class,
-            'synthetic_per_class_accuracy': synth_per_class,
-            'top_confusions': top_confusions,
-            'n_train': len(X_train),
-            'n_test_gt': len(X_test_gt),
-            'n_test_synthetic': len(X_query),
-            'kmer_size': k,
         }
 
     # ==================== Full Evaluation ====================
@@ -1060,28 +405,10 @@ class DNASequenceMetrics:
                  reference_seqs: List[str],
                  query_seqs: List[str],
                  query_name: str = "synthetic",
-                 cluster_assignments: Optional[np.ndarray] = None,
                  reference_celltypes: Optional[List[str]] = None,
                  query_celltypes: Optional[List[str]] = None,
-                 show_progress: bool = True,
-                 compute_distributional: bool = True) -> Dict:
-        """
-        Run full evaluation suite.
-
-        Args:
-            reference_seqs: Ground truth sequences
-            query_seqs: Synthetic/query sequences to evaluate
-            query_name: Name identifier for the query dataset
-            cluster_assignments: Optional cluster labels for query_seqs
-            reference_celltypes: Optional cell type labels for reference (TAG column)
-            query_celltypes: Optional cell type labels for query (TAG column)
-            show_progress: Show progress bars
-            compute_distributional: Whether to compute distributional metrics
-                                   (discriminator, Fréchet, MMD) - slower but informative
-
-        Returns:
-            Dictionary with all metrics
-        """
+                 show_progress: bool = True) -> Dict:
+        """Run full evaluation suite."""
         print(f"\n{'=' * 60}")
         print(f"Evaluating: {query_name}")
         print(f"Reference: {len(reference_seqs)} sequences")
@@ -1094,86 +421,30 @@ class DNASequenceMetrics:
             'n_query': len(query_seqs),
         }
 
-        # Global metrics
-        print("\n[1/9] Computing novelty metrics...")
-        results['novelty'] = self.compute_novelty(reference_seqs, query_seqs, show_progress)
+        print("\n[1/4] Computing diversity metrics...")
+        results['diversity'] = self.compute_diversity(query_seqs)
 
-        print("\n[2/9] Computing diversity metrics...")
-        results['diversity'] = self.compute_diversity(query_seqs, show_progress)
-
-        print("\n[3/9] Computing k-mer metrics...")
+        print("\n[2/4] Computing k-mer metrics...")
         results['kmer'] = self.compute_kmer_metrics(reference_seqs, query_seqs)
 
-        print("\n[4/9] Computing GC content metrics...")
+        print("\n[3/4] Computing GC content metrics...")
         results['gc_content'] = self.compute_gc_metrics(reference_seqs, query_seqs)
 
-        # Distributional metrics (new)
-        if compute_distributional:
-            print("\n[5/9] Training discriminator (can synthetic be distinguished from real?)...")
-            results['discriminator'] = self.compute_discriminator_metrics(
-                reference_seqs, query_seqs, k=4, show_progress=show_progress
-            )
+        print("\n[4/4] Training discriminator (can we tell synthetic from real?)...")
+        results['discriminator'] = self.compute_discriminator_metrics(
+            reference_seqs, query_seqs, k=4, show_progress=show_progress
+        )
 
-            print("\n[6/9] Computing Fréchet distance (like FID for DNA)...")
-            results['frechet'] = self.compute_frechet_distance(
-                reference_seqs, query_seqs, k=4, show_progress=show_progress
-            )
-
-            print("\n[7/9] Computing MMD (kernel-based distributional distance)...")
-            results['mmd'] = self.compute_mmd(
-                reference_seqs, query_seqs, k=4, show_progress=show_progress
-            )
-
-            print("\n[8/9] Computing precision/recall/coverage...")
-            results['precision_recall'] = self.compute_precision_recall_density_coverage(
-                reference_seqs, query_seqs, k=4, show_progress=show_progress
-            )
-
-        # Cell-type conditional fidelity (if cell types provided)
+        # Cell-type fidelity if provided
         if reference_celltypes is not None and query_celltypes is not None:
-            print("\n[9/9] Computing cell-type conditional fidelity...")
+            print("\n[Bonus] Computing cell-type conditional fidelity...")
             results['celltype_fidelity'] = self.compute_celltype_fidelity(
                 reference_seqs, reference_celltypes,
                 query_seqs, query_celltypes,
                 k=4, show_progress=show_progress
             )
 
-        # Per-cluster analysis if provided
-        if cluster_assignments is not None:
-            print("\n[Bonus] Computing per-cluster metrics...")
-            results['per_cluster'] = self._compute_per_cluster_metrics(
-                reference_seqs, query_seqs, cluster_assignments, show_progress
-            )
-
         return results
-
-    def _compute_per_cluster_metrics(self,
-                                     reference_seqs: List[str],
-                                     query_seqs: List[str],
-                                     cluster_assignments: np.ndarray,
-                                     show_progress: bool) -> Dict:
-        """Compute metrics for each cluster."""
-        unique_clusters = np.unique(cluster_assignments)
-        cluster_results = {}
-
-        for cluster_id in unique_clusters:
-            if cluster_id == -1:  # Skip noise
-                continue
-
-            mask = cluster_assignments == cluster_id
-            cluster_seqs = [query_seqs[i] for i in range(len(query_seqs)) if mask[i]]
-
-            print(f"\n  Cluster {cluster_id}: {len(cluster_seqs)} sequences")
-
-            cluster_results[int(cluster_id)] = {
-                'n_sequences': len(cluster_seqs),
-                'novelty': self.compute_novelty(reference_seqs, cluster_seqs, False),
-                'diversity': self.compute_diversity(cluster_seqs, False),
-                'kmer': self.compute_kmer_metrics(reference_seqs, cluster_seqs),
-                'gc_content': self.compute_gc_metrics(reference_seqs, cluster_seqs),
-            }
-
-        return cluster_results
 
 
 class MetricsVisualizer:
@@ -1183,215 +454,212 @@ class MetricsVisualizer:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Color palette for multiple models
         self.model_colors = {
-            'ground_truth': '#2ecc71',  # Green
-            'original': '#e74c3c',  # Red
-            'improved': '#3498db',  # Blue
-            'model_3': '#9b59b6',  # Purple
-            'model_4': '#f39c12',  # Orange
-            'model_5': '#1abc9c',  # Teal
-            'model_6': '#e67e22',  # Dark orange
-            'model_7': '#34495e',  # Dark gray
+            'ground_truth': '#2ecc71',
+            'reference': '#2ecc71',
         }
 
-    def plot_novelty_curves(self,
-                            results_dict: Dict[str, Dict],
-                            output_name: str = "novelty_curves") -> str:
-        """Plot Novelty@r curves for multiple models."""
-        fig, ax = plt.subplots(figsize=(10, 7))
+    def _get_color(self, name: str, idx: int = 0) -> str:
+        """Get color for a model name."""
+        if name.lower() in self.model_colors:
+            return self.model_colors[name.lower()]
+        colors = ['#e74c3c', '#3498db', '#9b59b6', '#f39c12', '#1abc9c', '#e67e22']
+        return colors[idx % len(colors)]
 
+    def plot_gc_content_barplot(self,
+                                results_dict: Dict[str, Dict],
+                                reference_gc_mean: float,
+                                reference_gc_se: float,
+                                output_name: str = "gc_content_barplot") -> str:
+        """Plot GC content as bar plot with standard error bars."""
+        models = ['Reference'] + list(results_dict.keys())
+        means = [reference_gc_mean] + [results_dict[m]['gc_content']['query_mean'] for m in results_dict]
+        ses = [reference_gc_se] + [results_dict[m]['gc_content']['query_se'] for m in results_dict]
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+        colors = [self._get_color('reference')] + [self._get_color(m, i) for i, m in enumerate(results_dict.keys())]
+
+        bars = ax.bar(models, means, yerr=ses, capsize=5, color=colors,
+                      edgecolor='black', linewidth=1.5, error_kw={'linewidth': 2})
+
+        ax.set_ylabel('GC Content')
+        ax.set_title('GC Content Comparison')
+
+        # Set y-axis to show differences clearly
+        y_min = min(means) - max(ses) * 3
+        y_max = max(means) + max(ses) * 3
+        ax.set_ylim(max(0, y_min), min(1, y_max))
+
+        # Add significance markers
         for i, (name, results) in enumerate(results_dict.items()):
-            novelty = results['novelty']
-            radii = sorted([int(k.split('@')[1]) for k in novelty.keys() if k.startswith('novelty@')])
-            values = [novelty[f'novelty@{r}'] for r in radii]
+            pval = results['gc_content']['ttest_pvalue']
+            if pval < 0.001:
+                sig = '***'
+            elif pval < 0.01:
+                sig = '**'
+            elif pval < 0.05:
+                sig = '*'
+            else:
+                sig = 'ns'
+            ax.text(i + 1, means[i + 1] + ses[i + 1] + 0.005, sig,
+                    ha='center', va='bottom', fontsize=12)
 
-            color = list(self.model_colors.values())[i % len(self.model_colors)]
-            ax.plot(radii, values, 'o-', label=name, color=color, linewidth=2, markersize=8)
-
-        ax.set_xlabel('Radius (r) - Hamming Distance Threshold')
-        ax.set_ylabel('Novelty@r (fraction of novel sequences)')
-        ax.set_title('Sequence Novelty: Fraction of Sequences Beyond Distance r from Training Set')
-        ax.legend(loc='lower right')
-        ax.grid(True, alpha=0.3)
-        ax.set_ylim(0, 1.05)
-
-        filepath = self.output_dir / f"{output_name}.png"
-        plt.savefig(filepath)
-        plt.close()
-        return str(filepath)
-
-    def plot_gc_distributions(self,
-                              results_dict: Dict[str, Dict],
-                              reference_gc: List[float],
-                              output_name: str = "gc_distributions") -> str:
-        """Plot GC content distributions."""
-        n_models = len(results_dict)
-        fig, axes = plt.subplots(1, n_models + 1, figsize=(4 * (n_models + 1), 5))
-
-        if n_models == 0:
-            axes = [axes]
-
-        # Plot reference
-        axes[0].hist(reference_gc, bins=50, alpha=0.7, color=self.model_colors['ground_truth'],
-                     edgecolor='black', linewidth=0.5)
-        axes[0].axvline(np.mean(reference_gc), color='black', linestyle='--',
-                        label=f'Mean: {np.mean(reference_gc):.3f}')
-        axes[0].set_xlabel('GC Content')
-        axes[0].set_ylabel('Count')
-        axes[0].set_title('Ground Truth')
-        axes[0].legend()
-
-        # Plot each model
-        for i, (name, results) in enumerate(results_dict.items()):
-            gc_dist = results['gc_content']['query_distribution']
-            color = list(self.model_colors.values())[(i + 1) % len(self.model_colors)]
-
-            axes[i + 1].hist(gc_dist, bins=50, alpha=0.7, color=color,
-                             edgecolor='black', linewidth=0.5)
-            axes[i + 1].axvline(np.mean(gc_dist), color='black', linestyle='--',
-                                label=f'Mean: {np.mean(gc_dist):.3f}')
-            axes[i + 1].set_xlabel('GC Content')
-            axes[i + 1].set_title(f'{name}\np={results["gc_content"]["ttest_pvalue"]:.2e}')
-            axes[i + 1].legend()
-
-        plt.suptitle('GC Content Distributions', fontsize=16, y=1.02)
         plt.tight_layout()
-
         filepath = self.output_dir / f"{output_name}.png"
         plt.savefig(filepath)
         plt.close()
         return str(filepath)
 
-    def plot_kmer_heatmap(self,
-                          results_dict: Dict[str, Dict],
-                          output_name: str = "kmer_heatmap") -> str:
-        """Plot k-mer similarity metrics as heatmap."""
-        # Prepare data
+    def plot_kmer_jsd_heatmap(self,
+                              results_dict: Dict[str, Dict],
+                              output_name: str = "kmer_jsd_heatmap") -> str:
+        """Plot k-mer Jensen-Shannon Divergence as heatmap."""
         models = list(results_dict.keys())
         k_sizes = sorted(results_dict[models[0]]['kmer'].keys())
 
-        # Create matrices for JSD and cosine similarity
         jsd_matrix = np.zeros((len(models), len(k_sizes)))
-        cos_matrix = np.zeros((len(models), len(k_sizes)))
 
         for i, model in enumerate(models):
             for j, k in enumerate(k_sizes):
                 jsd_matrix[i, j] = results_dict[model]['kmer'][k]['jensen_shannon_divergence']
-                cos_matrix[i, j] = results_dict[model]['kmer'][k]['cosine_similarity']
 
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        fig, ax = plt.subplots(figsize=(10, max(4, len(models) * 0.8)))
 
-        # JSD heatmap (lower is better)
-        sns.heatmap(jsd_matrix, ax=axes[0], annot=True, fmt='.4f',
+        sns.heatmap(jsd_matrix, ax=ax, annot=True, fmt='.4f',
                     xticklabels=[k.replace('-mer', '') for k in k_sizes],
-                    yticklabels=models, cmap='Reds', vmin=0, vmax=0.5)
-        axes[0].set_xlabel('K-mer Size')
-        axes[0].set_ylabel('Model')
-        axes[0].set_title('Jensen-Shannon Divergence\n(lower = more similar to GT)')
+                    yticklabels=models, cmap='Reds', vmin=0,
+                    cbar_kws={'label': 'Jensen-Shannon Divergence'})
 
-        # Cosine similarity heatmap (higher is better)
-        sns.heatmap(cos_matrix, ax=axes[1], annot=True, fmt='.4f',
-                    xticklabels=[k.replace('-mer', '') for k in k_sizes],
-                    yticklabels=models, cmap='Greens', vmin=0.8, vmax=1.0)
-        axes[1].set_xlabel('K-mer Size')
-        axes[1].set_ylabel('Model')
-        axes[1].set_title('Cosine Similarity\n(higher = more similar to GT)')
+        ax.set_xlabel('K-mer Size')
+        ax.set_ylabel('Model')
+        ax.set_title('K-mer Distribution Similarity')
 
         plt.tight_layout()
-
         filepath = self.output_dir / f"{output_name}.png"
         plt.savefig(filepath)
         plt.close()
         return str(filepath)
 
-    def plot_diversity_comparison(self,
-                                  results_dict: Dict[str, Dict],
-                                  output_name: str = "diversity_comparison") -> str:
-        """Plot diversity metrics comparison."""
+    def plot_discriminator_accuracy(self,
+                                    results_dict: Dict[str, Dict],
+                                    output_name: str = "discriminator_accuracy") -> str:
+        """Plot discriminator balanced accuracy with confidence intervals."""
         models = list(results_dict.keys())
 
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        accs = []
+        stds = []
+        for m in models:
+            if 'discriminator' in results_dict[m]:
+                accs.append(results_dict[m]['discriminator']['balanced_accuracy'])
+                stds.append(results_dict[m]['discriminator']['balanced_accuracy_std'])
+            else:
+                accs.append(0.5)
+                stds.append(0)
 
-        # Mean pairwise Hamming distance
-        hamming_vals = [results_dict[m]['diversity']['mean_pairwise_hamming'] for m in models]
-        hamming_stds = [results_dict[m]['diversity']['std_pairwise_hamming'] for m in models]
+        fig, ax = plt.subplots(figsize=(8, 6))
 
-        colors = [list(self.model_colors.values())[i % len(self.model_colors)]
-                  for i in range(len(models))]
+        colors = [self._get_color(m, i) for i, m in enumerate(models)]
 
-        axes[0].bar(models, hamming_vals, yerr=hamming_stds, color=colors,
-                    edgecolor='black', capsize=5)
-        axes[0].set_ylabel('Mean Pairwise Hamming Distance')
-        axes[0].set_title('Sequence Diversity\n(higher = more diverse)')
-        axes[0].tick_params(axis='x', rotation=45)
+        # Plot bars with error bars (95% CI)
+        bars = ax.bar(models, accs, yerr=[1.96 * s for s in stds],
+                      capsize=5, color=colors, edgecolor='black', linewidth=1.5)
 
-        # Unique ratio
-        unique_vals = [results_dict[m]['diversity']['unique_ratio'] for m in models]
-        axes[1].bar(models, unique_vals, color=colors, edgecolor='black')
-        axes[1].set_ylabel('Unique Sequences Ratio')
-        axes[1].set_title('Uniqueness\n(1.0 = all unique)')
-        axes[1].set_ylim(0, 1.1)
-        axes[1].tick_params(axis='x', rotation=45)
+        # Add baseline at 0.5
+        ax.axhline(y=0.5, color='gray', linestyle='--', linewidth=2, label='Random chance (0.5)')
 
-        # Shannon entropy
-        entropy_vals = [results_dict[m]['diversity']['shannon_entropy'] for m in models]
-        axes[2].bar(models, entropy_vals, color=colors, edgecolor='black')
-        axes[2].set_ylabel('Shannon Entropy (bits)')
-        axes[2].set_title('Entropy\n(higher = more varied)')
-        axes[2].tick_params(axis='x', rotation=45)
+        # Add interpretation zones
+        ax.axhspan(0.5, 0.55, alpha=0.1, color='green', label='Indistinguishable')
+        ax.axhspan(0.55, 0.70, alpha=0.1, color='yellow')
+        ax.axhspan(0.70, 1.0, alpha=0.1, color='red')
 
+        ax.set_ylabel('Balanced Accuracy')
+        ax.set_title('Discriminator Accuracy\n(Can a classifier tell synthetic from real?)')
+        ax.set_ylim(0.4, 1.0)
+        ax.legend(loc='upper right')
+
+        # Add value labels
+        for bar, acc, std in zip(bars, accs, stds):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1.96 * std + 0.02,
+                    f'{acc:.1%}', ha='center', va='bottom', fontsize=11, fontweight='bold')
+
+        plt.xticks(rotation=45, ha='right')
         plt.tight_layout()
-
         filepath = self.output_dir / f"{output_name}.png"
         plt.savefig(filepath)
         plt.close()
         return str(filepath)
 
-    def plot_cluster_comparison(self,
-                                results_with_clusters: Dict,
-                                output_name: str = "cluster_metrics") -> str:
-        """Plot per-cluster metrics comparison."""
-        if 'per_cluster' not in results_with_clusters:
-            print("No cluster data available")
-            return None
+    def plot_discriminator_auc(self,
+                               results_dict: Dict[str, Dict],
+                               output_name: str = "discriminator_auc") -> str:
+        """Plot discriminator ROC-AUC with confidence intervals."""
+        models = list(results_dict.keys())
 
-        cluster_data = results_with_clusters['per_cluster']
-        clusters = sorted(cluster_data.keys())
+        aucs = []
+        stds = []
+        for m in models:
+            if 'discriminator' in results_dict[m]:
+                aucs.append(results_dict[m]['discriminator']['roc_auc'])
+                stds.append(results_dict[m]['discriminator']['roc_auc_std'])
+            else:
+                aucs.append(0.5)
+                stds.append(0)
 
-        fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+        fig, ax = plt.subplots(figsize=(8, 8))
 
-        colors = plt.cm.tab10(np.linspace(0, 1, len(clusters)))
 
-        # Cluster sizes
-        sizes = [cluster_data[c]['n_sequences'] for c in clusters]
-        axes[0, 0].bar([f'Cluster {c}' for c in clusters], sizes, color=colors, edgecolor='black')
-        axes[0, 0].set_ylabel('Number of Sequences')
-        axes[0, 0].set_title('Cluster Sizes')
+        bars = ax.bar(models, aucs, yerr=[1.96 * s for s in stds],
+                      capsize=5, color="gray", edgecolor='black', linewidth=1.5)
 
-        # Diversity per cluster
-        div_vals = [cluster_data[c]['diversity']['mean_pairwise_hamming'] for c in clusters]
-        axes[0, 1].bar([f'Cluster {c}' for c in clusters], div_vals, color=colors, edgecolor='black')
-        axes[0, 1].set_ylabel('Mean Pairwise Hamming')
-        axes[0, 1].set_title('Diversity per Cluster')
+        # Add baseline at 0.5
+        ax.axhline(y=0.5, color='black', linestyle='--', linewidth=2, label='Random chance (0.5)')
 
-        # GC content per cluster
-        gc_means = [cluster_data[c]['gc_content']['query_mean'] for c in clusters]
-        gc_stds = [cluster_data[c]['gc_content']['query_std'] for c in clusters]
-        axes[1, 0].bar([f'Cluster {c}' for c in clusters], gc_means, yerr=gc_stds,
-                       color=colors, edgecolor='black', capsize=5)
-        axes[1, 0].set_ylabel('GC Content')
-        axes[1, 0].set_title('GC Content per Cluster')
+        ax.set_ylabel('ROC-AUC')
+        ax.set_title('Discriminator ROC-AUC')
+        ax.set_ylim(0.4, 1.05)
+        ax.legend(loc='upper right')
 
-        # Novelty@5 per cluster
-        nov_vals = [cluster_data[c]['novelty'].get('novelty@5', 0) for c in clusters]
-        axes[1, 1].bar([f'Cluster {c}' for c in clusters], nov_vals, color=colors, edgecolor='black')
-        axes[1, 1].set_ylabel('Novelty@5')
-        axes[1, 1].set_title('Novelty per Cluster')
-        axes[1, 1].set_ylim(0, 1.1)
+        # Add value labels
+        for bar, auc, std in zip(bars, aucs, stds):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1.96 * std + 0.02,
+                    f'{auc:.3f}', ha='center', va='bottom', fontsize=11, fontweight='bold')
+
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        filepath = self.output_dir / f"{output_name}.png"
+        plt.savefig(filepath)
+        plt.close()
+        return str(filepath)
+
+    def plot_top_discriminating_kmers(self,
+                                      results_dict: Dict[str, Dict],
+                                      output_name: str = "top_discriminating_kmers") -> str:
+        """Plot top discriminating k-mers for each model."""
+        n_models = len(results_dict)
+        fig, axes = plt.subplots(1, n_models, figsize=(6 * n_models, 6))
+
+        if n_models == 1:
+            axes = [axes]
+
+        for ax, (name, results) in zip(axes, results_dict.items()):
+            if 'discriminator' not in results:
+                continue
+
+            top_kmers = results['discriminator']['top_discriminating_kmers'][:10]
+            kmers = [k[0] for k in top_kmers]
+            importances = [k[1] for k in top_kmers]
+
+            color = self._get_color(name, list(results_dict.keys()).index(name))
+
+            ax.barh(range(len(kmers)), importances, color=color, edgecolor='black')
+            ax.set_yticks(range(len(kmers)))
+            ax.set_yticklabels(kmers, fontfamily='monospace')
+            ax.set_xlabel('Feature Importance')
+            ax.set_title(f'{name}\nTop Discriminating 4-mers')
+            ax.invert_yaxis()
 
         plt.tight_layout()
-
         filepath = self.output_dir / f"{output_name}.png"
         plt.savefig(filepath)
         plt.close()
@@ -1399,104 +667,91 @@ class MetricsVisualizer:
 
     def plot_summary_dashboard(self,
                                results_dict: Dict[str, Dict],
-                               reference_gc: List[float],
+                               reference_gc_mean: float,
+                               reference_gc_se: float,
                                output_name: str = "metrics_dashboard") -> str:
-        """Create comprehensive dashboard with all key metrics."""
-        fig = plt.figure(figsize=(20, 16))
-
-        # Layout: 3 rows, 3 columns
-        gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
+        """Create comprehensive dashboard with key metrics."""
+        fig = plt.figure(figsize=(16, 12))
+        gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.3)
 
         models = list(results_dict.keys())
-        colors = [list(self.model_colors.values())[i % len(self.model_colors)]
-                  for i in range(len(models))]
+        colors = [self._get_color(m, i) for i, m in enumerate(models)]
 
-        # 1. Novelty curves (top left, spans 2 columns)
-        ax1 = fig.add_subplot(gs[0, :2])
-        for i, (name, results) in enumerate(results_dict.items()):
-            novelty = results['novelty']
-            radii = sorted([int(k.split('@')[1]) for k in novelty.keys() if k.startswith('novelty@')])
-            values = [novelty[f'novelty@{r}'] for r in radii]
-            ax1.plot(radii, values, 'o-', label=name, color=colors[i], linewidth=2, markersize=6)
-        ax1.set_xlabel('Radius (r)')
-        ax1.set_ylabel('Novelty@r')
-        ax1.set_title('A. Sequence Novelty')
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
+        # 1. GC Content Bar Plot (top left)
+        ax1 = fig.add_subplot(gs[0, 0])
+        all_models = ['Reference'] + models
+        gc_means = [reference_gc_mean] + [results_dict[m]['gc_content']['query_mean'] for m in models]
+        gc_ses = [reference_gc_se] + [results_dict[m]['gc_content']['query_se'] for m in models]
+        all_colors = [self._get_color('reference')] + colors
 
-        # 2. Min distance distribution (top right)
-        ax2 = fig.add_subplot(gs[0, 2])
-        for i, (name, results) in enumerate(results_dict.items()):
-            ax2.hist(results['novelty']['min_distance_distribution'], bins=30,
-                     alpha=0.5, label=name, color=colors[i], edgecolor='black')
-        ax2.set_xlabel('Min Hamming Distance to Training')
-        ax2.set_ylabel('Count')
-        ax2.set_title('B. Distance to Nearest Training Sequence')
-        ax2.legend()
+        ax1.bar(all_models, gc_means, yerr=gc_ses, capsize=5, color=all_colors,
+                edgecolor='black', linewidth=1.5)
+        ax1.set_ylabel('GC Content')
+        ax1.set_title('A. GC Content')
+        ax1.tick_params(axis='x', rotation=45)
 
-        # 3. GC content (middle left)
+        y_min = min(gc_means) - max(gc_ses) * 3
+        y_max = max(gc_means) + max(gc_ses) * 3
+        ax1.set_ylim(max(0, y_min), min(1, y_max))
+
+        # 2. K-mer JSD Heatmap (top right)
+        ax2 = fig.add_subplot(gs[0, 1])
+        k_sizes = sorted(results_dict[models[0]]['kmer'].keys())
+        jsd_matrix = np.zeros((len(models), len(k_sizes)))
+        for i, model in enumerate(models):
+            for j, k in enumerate(k_sizes):
+                jsd_matrix[i, j] = results_dict[model]['kmer'][k]['jensen_shannon_divergence']
+
+        sns.heatmap(jsd_matrix, ax=ax2, annot=True, fmt='.4f',
+                    xticklabels=[k.replace('-mer', '') for k in k_sizes],
+                    yticklabels=models, cmap='Reds', vmin=0)
+        ax2.set_xlabel('K-mer Size')
+        ax2.set_title('B. K-mer Jensen-Shannon Divergence')
+
+        # 3. Discriminator Accuracy (bottom left)
         ax3 = fig.add_subplot(gs[1, 0])
-        ax3.hist(reference_gc, bins=40, alpha=0.6, label='Ground Truth',
-                 color=self.model_colors['ground_truth'], edgecolor='black')
-        for i, (name, results) in enumerate(results_dict.items()):
-            ax3.hist(results['gc_content']['query_distribution'], bins=40,
-                     alpha=0.4, label=name, color=colors[i], edgecolor='black')
-        ax3.set_xlabel('GC Content')
-        ax3.set_ylabel('Count')
-        ax3.set_title('C. GC Content Distribution')
-        ax3.legend()
+        accs = [results_dict[m]['discriminator']['balanced_accuracy'] for m in models]
+        stds = [results_dict[m]['discriminator']['balanced_accuracy_std'] for m in models]
 
-        # 4. K-mer JSD (middle center)
+        bars = ax3.bar(models, accs, yerr=[1.96 * s for s in stds],
+                       capsize=5, color=colors, edgecolor='black', linewidth=1.5)
+        ax3.axhline(y=0.5, color='gray', linestyle='--', linewidth=2)
+        ax3.set_ylabel('Balanced Accuracy')
+        ax3.set_title('C. Discriminator Accuracy')
+        ax3.set_ylim(0.4, 1.0)
+        ax3.tick_params(axis='x', rotation=45)
+
+        for bar, acc in zip(bars, accs):
+            ax3.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.03,
+                     f'{acc:.1%}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+        # 4. Summary Table (bottom right)
         ax4 = fig.add_subplot(gs[1, 1])
-        x = np.arange(len(self.config.kmer_sizes) if hasattr(self, 'config') else 4)
-        width = 0.8 / len(models)
+        ax4.axis('off')
 
-        for i, (name, results) in enumerate(results_dict.items()):
-            k_sizes = sorted(results['kmer'].keys())
-            jsd_vals = [results['kmer'][k]['jensen_shannon_divergence'] for k in k_sizes]
-            ax4.bar(x + i * width, jsd_vals, width, label=name, color=colors[i], edgecolor='black')
-
-        ax4.set_xlabel('K-mer Size')
-        ax4.set_ylabel('JS Divergence')
-        ax4.set_title('D. K-mer Frequency Similarity')
-        ax4.set_xticks(x + width * (len(models) - 1) / 2)
-        ax4.set_xticklabels([k.replace('-mer', '') for k in k_sizes])
-        ax4.legend()
-
-        # 5. Diversity metrics (middle right)
-        ax5 = fig.add_subplot(gs[1, 2])
-        diversity_vals = [results_dict[m]['diversity']['mean_pairwise_hamming'] for m in models]
-        ax5.bar(models, diversity_vals, color=colors, edgecolor='black')
-        ax5.set_ylabel('Mean Pairwise Hamming')
-        ax5.set_title('E. Sequence Diversity')
-        ax5.tick_params(axis='x', rotation=45)
-
-        # 6. Summary table (bottom, spans all columns)
-        ax6 = fig.add_subplot(gs[2, :])
-        ax6.axis('off')
-
-        # Create summary table
-        headers = ['Model', 'Novelty@5', 'Diversity', 'GC Diff', '5-mer JSD', 'Unique%']
+        headers = ['Model', 'GC Diff', '5-mer JSD', 'Disc. Acc.', 'Interpretation']
         table_data = []
         for name, results in results_dict.items():
+            disc_acc = results['discriminator']['balanced_accuracy']
+            interp = results['discriminator']['interpretation'].split(' ')[0]  # First word
+
             row = [
                 name,
-                f"{results['novelty'].get('novelty@5', 0):.3f}",
-                f"{results['diversity']['mean_pairwise_hamming']:.4f}",
                 f"{results['gc_content']['mean_difference']:.4f}",
                 f"{results['kmer']['5-mer']['jensen_shannon_divergence']:.4f}",
-                f"{results['diversity']['unique_ratio'] * 100:.1f}%"
+                f"{disc_acc:.1%}",
+                interp,
             ]
             table_data.append(row)
 
-        table = ax6.table(cellText=table_data, colLabels=headers,
+        table = ax4.table(cellText=table_data, colLabels=headers,
                           loc='center', cellLoc='center')
         table.auto_set_font_size(False)
-        table.set_fontsize(12)
-        table.scale(1.2, 1.8)
-        ax6.set_title('F. Summary Metrics', fontsize=14, pad=20)
+        table.set_fontsize(10)
+        table.scale(1.2, 2)
+        ax4.set_title('D. Summary', fontsize=14, pad=20)
 
-        plt.suptitle('DNA Sequence Generation Evaluation Dashboard', fontsize=18, y=0.98)
+        plt.suptitle('DNA Sequence Generation Evaluation', fontsize=18, y=0.98)
 
         filepath = self.output_dir / f"{output_name}.png"
         plt.savefig(filepath)
@@ -1505,22 +760,12 @@ class MetricsVisualizer:
 
 
 def load_sequences(filepath: str, return_celltypes: bool = False) -> Union[List[str], Tuple[List[str], List[str]]]:
-    """
-    Load sequences from various file formats.
-
-    Args:
-        filepath: Path to sequence file
-        return_celltypes: If True and TAG column exists, return (sequences, celltypes)
-
-    Returns:
-        List of sequences, or tuple of (sequences, celltypes) if return_celltypes=True
-    """
+    """Load sequences from various file formats."""
     filepath = Path(filepath)
     celltypes = None
 
     if filepath.suffix == '.csv':
         df = pd.read_csv(filepath)
-        # Try common column names
         sequences = None
         for col in ['sequence', 'seq', 'Sequence', 'SEQ']:
             if col in df.columns:
@@ -1529,7 +774,6 @@ def load_sequences(filepath: str, return_celltypes: bool = False) -> Union[List[
         if sequences is None:
             sequences = df.iloc[:, 0].tolist()
 
-        # Check for cell type column
         if return_celltypes:
             for col in ['TAG', 'tag', 'celltype', 'cell_type', 'CellType']:
                 if col in df.columns:
@@ -1546,7 +790,6 @@ def load_sequences(filepath: str, return_celltypes: bool = False) -> Union[List[
         if sequences is None:
             sequences = df.iloc[:, 0].tolist()
 
-        # Check for cell type column
         if return_celltypes:
             for col in ['TAG', 'tag', 'celltype', 'cell_type', 'CellType']:
                 if col in df.columns:
@@ -1585,42 +828,28 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic usage with one synthetic dataset
   python 01_sequence_metrics_evaluation.py \\
-      --reference data/ground_truth.txt \\
-      --synthetic original:data/synthetic_original.txt
+      --reference data/ground_truth.csv \\
+      --synthetic original:data/synthetic.csv
 
-  # Multiple synthetic datasets
   python 01_sequence_metrics_evaluation.py \\
-      --reference data/ground_truth.txt \\
-      --synthetic original:data/synth_original.txt improved:data/synth_improved.txt
-
-  # With cluster assignments
-  python 01_sequence_metrics_evaluation.py \\
-      --reference data/ground_truth.txt \\
-      --synthetic original:data/synth.txt \\
-      --clusters data/cluster_assignments.csv \\
-      --output results/
+      --reference data/gt.csv \\
+      --synthetic model1:data/synth1.csv model2:data/synth2.csv \\
+      --celltype-fidelity
         """
     )
 
     parser.add_argument('--reference', '-r', required=True,
                         help='Path to reference/ground truth sequences')
     parser.add_argument('--synthetic', '-s', nargs='+', required=True,
-                        help='Synthetic datasets as name:path pairs (e.g., original:path/to/file.txt)')
-    parser.add_argument('--clusters', '-c', default=None,
-                        help='Path to CSV with cluster assignments (columns: id, cluster)')
+                        help='Synthetic datasets as name:path pairs')
     parser.add_argument('--output', '-o', default='evaluation_results',
                         help='Output directory for results')
     parser.add_argument('--kmer-sizes', nargs='+', type=int, default=[3, 5, 7, 9],
                         help='K-mer sizes to analyze')
-    parser.add_argument('--novelty-radii', nargs='+', type=int, default=[1, 2, 3, 5, 10, 15, 20],
-                        help='Radii for novelty@r calculation')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--no-distributional', action='store_true',
-                        help='Skip distributional metrics (discriminator, Fréchet, MMD) for faster runs')
     parser.add_argument('--celltype-fidelity', action='store_true',
-                        help='Compute cell-type conditional fidelity (requires TAG column in files)')
+                        help='Compute cell-type conditional fidelity (requires TAG column)')
 
     args = parser.parse_args()
 
@@ -1630,35 +859,30 @@ Examples:
 
     config = EvaluationConfig(
         kmer_sizes=args.kmer_sizes,
-        novelty_radii=args.novelty_radii,
         random_seed=args.seed
     )
 
     evaluator = DNASequenceMetrics(config)
     visualizer = MetricsVisualizer(output_dir=str(output_dir / 'figures'))
 
-    # Load reference sequences (with cell types if requested)
+    # Load reference sequences
     print(f"Loading reference sequences from {args.reference}...")
     if args.celltype_fidelity:
         reference_seqs, reference_celltypes = load_sequences(args.reference, return_celltypes=True)
         if reference_celltypes is None:
-            print("WARNING: No cell type column (TAG) found in reference file. Disabling cell-type fidelity.")
+            print("WARNING: No cell type column found. Disabling cell-type fidelity.")
             args.celltype_fidelity = False
-        else:
-            print(f"Loaded {len(reference_seqs)} reference sequences with {len(set(reference_celltypes))} cell types")
     else:
         reference_seqs = load_sequences(args.reference)
         reference_celltypes = None
     print(f"Loaded {len(reference_seqs)} reference sequences")
 
-    # Load cluster assignments if provided
-    cluster_assignments = None
-    if args.clusters:
-        cluster_df = pd.read_csv(args.clusters)
-        cluster_assignments = cluster_df['cluster'].values
-        print(f"Loaded cluster assignments: {len(np.unique(cluster_assignments))} clusters")
+    # Compute reference GC stats
+    ref_gc = np.array([evaluator.compute_gc_content(s) for s in reference_seqs])
+    ref_gc_mean = float(np.mean(ref_gc))
+    ref_gc_se = float(sem(ref_gc))
 
-    # Parse synthetic datasets (with cell types if requested)
+    # Parse synthetic datasets
     synthetic_datasets = {}
     synthetic_celltypes = {}
     for spec in args.synthetic:
@@ -1673,18 +897,13 @@ Examples:
             seqs, celltypes = load_sequences(path, return_celltypes=True)
             synthetic_datasets[name] = seqs
             synthetic_celltypes[name] = celltypes
-            if celltypes is None:
-                print(f"WARNING: No cell type column (TAG) found in {path}.")
-            else:
-                print(f"Loaded {len(seqs)} sequences with {len(set(celltypes))} cell types")
         else:
             synthetic_datasets[name] = load_sequences(path)
         print(f"Loaded {len(synthetic_datasets[name])} sequences")
 
-    # Run evaluation for each dataset
+    # Run evaluation
     all_results = {}
     for name, synth_seqs in synthetic_datasets.items():
-        # Get cell types for this dataset
         ref_ct = reference_celltypes if args.celltype_fidelity else None
         syn_ct = synthetic_celltypes.get(name) if args.celltype_fidelity else None
 
@@ -1692,10 +911,8 @@ Examples:
             reference_seqs,
             synth_seqs,
             query_name=name,
-            cluster_assignments=cluster_assignments,
             reference_celltypes=ref_ct,
             query_celltypes=syn_ct,
-            compute_distributional=not args.no_distributional
         )
         all_results[name] = results
 
@@ -1704,47 +921,27 @@ Examples:
     print("Generating visualizations...")
     print("=" * 60)
 
-    ref_gc = [evaluator.compute_gc_content(s) for s in reference_seqs]
-
     figures = {
-        'novelty_curves': visualizer.plot_novelty_curves(all_results),
-        'gc_distributions': visualizer.plot_gc_distributions(all_results, ref_gc),
-        'kmer_heatmap': visualizer.plot_kmer_heatmap(all_results),
-        'diversity_comparison': visualizer.plot_diversity_comparison(all_results),
-        'dashboard': visualizer.plot_summary_dashboard(all_results, ref_gc),
+        'gc_content': visualizer.plot_gc_content_barplot(all_results, ref_gc_mean, ref_gc_se),
+        'kmer_jsd': visualizer.plot_kmer_jsd_heatmap(all_results),
+        'discriminator_accuracy': visualizer.plot_discriminator_accuracy(all_results),
+        'discriminator_auc': visualizer.plot_discriminator_auc(all_results),
+        'top_kmers': visualizer.plot_top_discriminating_kmers(all_results),
+        'dashboard': visualizer.plot_summary_dashboard(all_results, ref_gc_mean, ref_gc_se),
     }
-
-    # Per-cluster plots if available
-    for name, results in all_results.items():
-        if 'per_cluster' in results:
-            fig_path = visualizer.plot_cluster_comparison(
-                results, output_name=f"cluster_metrics_{name}"
-            )
-            figures[f'cluster_metrics_{name}'] = fig_path
 
     # Save results to JSON
     results_file = output_dir / 'evaluation_results.json'
-
-    # Remove distribution arrays for JSON (too large)
     json_results = {}
     for name, results in all_results.items():
-        json_results[name] = {k: v for k, v in results.items()}
-        # Remove large arrays
-        if 'novelty' in json_results[name]:
-            json_results[name]['novelty'] = {
-                k: v for k, v in json_results[name]['novelty'].items()
-                if not k.endswith('_distribution')
-            }
-        if 'diversity' in json_results[name]:
-            json_results[name]['diversity'] = {
-                k: v for k, v in json_results[name]['diversity'].items()
-                if not k.endswith('_distribution')
-            }
-        if 'gc_content' in json_results[name]:
-            json_results[name]['gc_content'] = {
-                k: v for k, v in json_results[name]['gc_content'].items()
-                if not k.endswith('_distribution')
-            }
+        json_results[name] = results.copy()
+        # Convert tuples to lists for JSON
+        if 'discriminator' in json_results[name]:
+            disc = json_results[name]['discriminator']
+            if 'balanced_accuracy_ci95' in disc:
+                disc['balanced_accuracy_ci95'] = list(disc['balanced_accuracy_ci95'])
+            if 'roc_auc_ci95' in disc:
+                disc['roc_auc_ci95'] = list(disc['roc_auc_ci95'])
 
     with open(results_file, 'w') as f:
         json.dump(json_results, f, indent=2)
@@ -1756,48 +953,29 @@ Examples:
         row = {
             'model': name,
             'n_sequences': results['n_query'],
-            'novelty@1': results['novelty'].get('novelty@1', None),
-            'novelty@5': results['novelty'].get('novelty@5', None),
-            'novelty@10': results['novelty'].get('novelty@10', None),
-            'min_dist_mean': results['novelty']['min_distance_mean'],
-            'diversity': results['diversity']['mean_pairwise_hamming'],
-            'unique_ratio': results['diversity']['unique_ratio'],
+            'gc_mean': results['gc_content']['query_mean'],
+            'gc_se': results['gc_content']['query_se'],
             'gc_difference': results['gc_content']['mean_difference'],
             'gc_pvalue': results['gc_content']['ttest_pvalue'],
         }
 
-        # Add k-mer metrics
+        # K-mer metrics
         for k in args.kmer_sizes:
             key = f'{k}-mer'
             if key in results['kmer']:
                 row[f'{k}mer_jsd'] = results['kmer'][key]['jensen_shannon_divergence']
-                row[f'{k}mer_cosine'] = results['kmer'][key]['cosine_similarity']
 
-        # Add distributional metrics (new)
-        if 'discriminator' in results:
-            row['discriminator_balanced_acc'] = results['discriminator']['balanced_accuracy']
-            row['discriminator_auc'] = results['discriminator']['roc_auc']
-            row['discriminator_interpretation'] = results['discriminator']['interpretation']
+        # Discriminator
+        row['discriminator_balanced_acc'] = results['discriminator']['balanced_accuracy']
+        row['discriminator_balanced_acc_std'] = results['discriminator']['balanced_accuracy_std']
+        row['discriminator_auc'] = results['discriminator']['roc_auc']
+        row['discriminator_interpretation'] = results['discriminator']['interpretation']
 
-        if 'frechet' in results:
-            row['frechet_distance'] = results['frechet']['frechet_distance']
-
-        if 'mmd' in results:
-            row['mmd_linear'] = results['mmd']['mmd_linear']
-            row['mmd_rbf'] = results['mmd']['mmd_rbf_median_gamma']
-
-        if 'precision_recall' in results:
-            row['precision'] = results['precision_recall']['precision']
-            row['recall'] = results['precision_recall']['recall']
-            row['f1_score'] = results['precision_recall']['f1_score']
-            row['coverage'] = results['precision_recall']['coverage']
-
-        # Add cell-type fidelity metrics
+        # Cell-type fidelity
         if 'celltype_fidelity' in results:
             row['celltype_gt_accuracy'] = results['celltype_fidelity']['gt_accuracy']
             row['celltype_synth_accuracy'] = results['celltype_fidelity']['synthetic_accuracy']
             row['celltype_fidelity_gap'] = results['celltype_fidelity']['fidelity_gap']
-            row['celltype_interpretation'] = results['celltype_fidelity']['interpretation']
 
         summary_rows.append(row)
 
@@ -1806,7 +984,7 @@ Examples:
     summary_df.to_csv(summary_file, index=False)
     print(f"Summary saved to {summary_file}")
 
-    # Print final summary
+    # Print summary
     print("\n" + "=" * 60)
     print("EVALUATION COMPLETE")
     print("=" * 60)

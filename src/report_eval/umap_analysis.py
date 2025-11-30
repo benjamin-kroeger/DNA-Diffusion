@@ -7,6 +7,7 @@ Creates UMAP visualizations of DNA sequence embeddings with:
 - HDBSCAN clustering to identify structure in embedding space
 - Ground truth vs synthetic comparison
 - Cluster assignment export for downstream analysis
+- Highlight specific sequences from CSV file
 
 Key output: Shows that synthetic data clusters into specific UMAP regions,
 potentially indicating mode collapse.
@@ -24,7 +25,7 @@ import matplotlib.patches as mpatches
 from matplotlib.colors import ListedColormap
 import seaborn as sns
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Set
 from dataclasses import dataclass, field
 import argparse
 import json
@@ -296,6 +297,33 @@ class UMAPVisualizer:
         self.clusterer = None
 
     @staticmethod
+    def load_highlight_ids(csv_path: str) -> Set[str]:
+        """
+        Load sequence IDs to highlight from CSV file.
+
+        Expected CSV format:
+            sequence_id
+            chr1_12345_12456_12400
+            chr2_23456_23567_23500
+            ...
+
+        Args:
+            csv_path: Path to CSV file with sequence_id column
+
+        Returns:
+            Set of sequence IDs to highlight
+        """
+        df = pd.read_csv(csv_path)
+
+        if 'sequence_id' not in df.columns:
+            raise ValueError(f"CSV must have 'sequence_id' column. Found columns: {df.columns.tolist()}")
+
+        highlight_ids = set(df['sequence_id'].astype(str))
+        print(f"\nLoaded {len(highlight_ids)} sequence IDs to highlight from {csv_path}")
+
+        return highlight_ids
+
+    @staticmethod
     def extract_chromosome(sample_id: str) -> str:
         """
         Extract chromosome from sample ID.
@@ -311,6 +339,80 @@ class UMAPVisualizer:
             return 'unknown'
         except:
             return 'unknown'
+
+    def plot_highlighted_sequences(self,
+                                   results: Dict,
+                                   highlight_ids: Set[str],
+                                   output_name: str = 'umap_highlighted') -> str:
+        """
+        Plot UMAP with specific sequences highlighted.
+
+        Args:
+            results: Results dictionary from analyze_multiple_datasets
+            highlight_ids: Set of sequence IDs to highlight
+            output_name: Output filename (without extension)
+
+        Returns:
+            Path to saved figure
+        """
+        fig, ax = plt.subplots(figsize=(14, 12))
+
+        Z = results['umap_coords']
+        sequence_ids = results['sequence_ids']
+
+        # Convert sequence_ids to strings for comparison
+        sequence_ids_str = np.array([str(sid) for sid in sequence_ids])
+
+        # Create mask for highlighted sequences
+        highlight_mask = np.array([sid in highlight_ids for sid in sequence_ids_str])
+        background_mask = ~highlight_mask
+
+        n_highlighted = np.sum(highlight_mask)
+        n_background = np.sum(background_mask)
+
+        print(f"\n  Plotting: {n_highlighted} highlighted sequences, {n_background} background sequences")
+
+        # Plot background points first (in gray, small, transparent)
+        ax.scatter(Z[background_mask, 0], Z[background_mask, 1],
+                   s=3, alpha=0.3, c='lightgray',
+                   label=f'Other sequences (n={n_background})',
+                   rasterized=True)
+
+        # Plot highlighted points on top (larger, opaque, colored)
+        if n_highlighted > 0:
+            ax.scatter(Z[highlight_mask, 0], Z[highlight_mask, 1],
+                       s=30, alpha=0.5, c='#e74c3c',  # Red
+                       edgecolors='darkred', linewidths=0.5,
+                       label=f'Highlighted sequences (n={n_highlighted})',
+                       rasterized=True)
+
+        ax.set_xlabel('UMAP 1')
+        ax.set_ylabel('UMAP 2')
+        ax.set_title('Highlighted Sequences in UMAP Space')
+        ax.legend(markerscale=2, loc='upper right')
+        ax.grid(True, alpha=0.3)
+
+        filepath = self.output_dir / f"{output_name}.png"
+        plt.savefig(filepath)
+        plt.close()
+
+        # Also export highlighted sequence coordinates
+        if n_highlighted > 0:
+            highlight_df = pd.DataFrame({
+                'sequence_id': sequence_ids_str[highlight_mask],
+                'umap_1': Z[highlight_mask, 0],
+                'umap_2': Z[highlight_mask, 1],
+                'source': results['source_labels'][highlight_mask],
+                'dataset': results['dataset_names'][highlight_mask],
+                'cell_type': results['cell_type_labels'][highlight_mask],
+                'cluster': results['cluster_labels'][highlight_mask],
+            })
+
+            csv_path = self.output_dir / f"{output_name}_coordinates.csv"
+            highlight_df.to_csv(csv_path, index=False)
+            print(f"  Exported highlighted coordinates to: {csv_path}")
+
+        return str(filepath)
 
     def plot_by_chromosome(self, results: Dict, output_name: str = 'umap_chromosomes') -> str:
         """Plot UMAP colored by chromosome."""
@@ -427,7 +529,7 @@ class UMAPVisualizer:
     def average_pool(self, embeddings: np.ndarray) -> np.ndarray:
         """Average pool 3D embeddings to 2D."""
         if len(embeddings.shape) == 3:
-           return embeddings.mean(axis=1)
+            return embeddings.mean(axis=1)
         else:
             return embeddings
 
@@ -1106,6 +1208,12 @@ Examples:
       --synthetic model1:data/s1.h5 \\
       --load-umap previous_results/ \\
       --min-cluster-size 20 --min-samples 5 --cluster-method leaf
+
+  # Highlight specific sequences from CSV
+  python 02_umap_clustering.py \\
+      --reference gt:data/gt.h5 \\
+      --synthetic model1:data/s1.h5 \\
+      --highlight-csv sequences_to_highlight.csv
         """
     )
 
@@ -1139,6 +1247,10 @@ Examples:
     # Load previous UMAP
     parser.add_argument('--load-umap', type=str, default=None,
                         help='Path to directory with previous UMAP results (skips UMAP, re-runs HDBSCAN only)')
+
+    # Highlight specific sequences
+    parser.add_argument('--highlight-csv', type=str, default=None,
+                        help='Path to CSV file with sequence IDs to highlight (expects "sequence_id" column)')
 
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
 
@@ -1177,6 +1289,11 @@ Examples:
         alpha=args.alpha
     )
 
+    # Load highlight IDs if provided
+    highlight_ids = None
+    if args.highlight_csv:
+        highlight_ids = UMAPVisualizer.load_highlight_ids(args.highlight_csv)
+
     # Run analysis
     visualizer = UMAPVisualizer(config=umap_config, output_dir=args.output)
     results = visualizer.analyze_multiple_datasets(
@@ -1200,6 +1317,12 @@ Examples:
         'dashboard': visualizer.plot_comprehensive_dashboard(results),
         'concentration': visualizer.plot_synthetic_concentration(results),
     }
+
+    # Add highlighted sequences plot if CSV provided
+    if highlight_ids:
+        figures['highlighted'] = visualizer.plot_highlighted_sequences(
+            results, highlight_ids, output_name='umap_highlighted'
+        )
 
     # Export data
     cluster_file = visualizer.export_cluster_assignments(results)
@@ -1229,7 +1352,8 @@ Examples:
         'results': {
             'n_clusters': results['n_clusters'],
             'n_total_samples': len(results['umap_coords']),
-        }
+        },
+        'highlight_csv': args.highlight_csv,
     }
 
     with open(Path(args.output) / 'analysis_config.json', 'w') as f:
