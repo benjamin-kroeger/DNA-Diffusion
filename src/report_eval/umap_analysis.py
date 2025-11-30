@@ -427,8 +427,15 @@ class UMAPVisualizer:
     def average_pool(self, embeddings: np.ndarray) -> np.ndarray:
         """Average pool 3D embeddings to 2D."""
         if len(embeddings.shape) == 3:
-            return embeddings.mean(axis=1)
-        return embeddings
+           return embeddings.mean(axis=1)
+        else:
+            return embeddings
+
+        # embeddings_flat = embeddings.reshape(embeddings.shape[0], -1)
+        # from sklearn.decomposition import PCA
+        # embeddings_pca = PCA(n_components=512).fit_transform(embeddings_flat)
+        #
+        # return embeddings_pca
 
     def fit_umap(self, embeddings: np.ndarray) -> np.ndarray:
         """Fit UMAP on embeddings."""
